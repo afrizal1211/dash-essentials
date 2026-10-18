@@ -59,4 +59,4 @@ else
     echo "App IPC: not verified yet; open Dash Essential once"
 fi
 
-echo "$DASH_SNAPSHOT" | tr ';' '\n' | grep -E '^(io|touch|touch_ack|touch_resampler_ready|perf)=' 2>/dev/null
+echo "$DASH_SNAPSHOT" | tr ';' '\n' | grep -E '^(io|touch|touch_ack|touch_error|touch_error_code|touch_resampler_ready|perf)=' 2>/dev/null

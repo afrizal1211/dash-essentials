@@ -2428,10 +2428,17 @@ fn touch_profile_is_live(profile: i32) -> bool {
     };
     let panel = touch_panel_code();
     let native_matches = if vendor_binder::touch_available() {
-        let thp_matches = locate_touch_thp_layout()
-            .and_then(|layout| read_touch_thp_rate(layout, layout.current_rate_addr))
-            .map(|rate| rate == expected_rate)
-            .unwrap_or(false);
+        // Dash's libtouchreport_hal.so does not carry the Rodin in-memory THP
+        // timing block, so the memory readback can only be trusted when the
+        // block is actually locatable. Without it the vendor TouchFeature HAL
+        // is the authority; `TOUCH_APPLY_ACK` still gates this decision at the
+        // keepalive call site.
+        let thp_matches = match locate_touch_thp_layout() {
+            Ok(layout) => read_touch_thp_rate(layout, layout.current_rate_addr)
+                .map(|rate| rate == expected_rate)
+                .unwrap_or(false),
+            Err(_) => true,
+        };
         thp_matches && (panel != 1 || goodix_report_rate_hz() == Some(expected_rate))
     } else if panel == 1 {
         goodix_report_rate_hz() == Some(expected_rate)
@@ -2587,6 +2594,82 @@ fn apply_touch_driver_fallback(profile: i32, panel: i32) -> Result<(), String> {
     ))
 }
 
+fn touch_last_error() -> &'static Mutex<String> {
+    TOUCH_LAST_ERROR.get_or_init(|| Mutex::new(String::new()))
+}
+
+fn touch_error_text() -> String {
+    touch_last_error()
+        .lock()
+        .map(|slot| slot.clone())
+        .unwrap_or_default()
+}
+
+fn snapshot_safe_text(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric()
+                || matches!(c, ' ' | '_' | '-' | '.' | ':' | '/' | ',' | '(' | ')')
+            {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(120)
+        .collect()
+}
+
+/// Map a touch apply failure onto a stable code the app can render without
+/// parsing free text. `0` means the last apply succeeded.
+fn touch_error_code_for(error: &str) -> i32 {
+    if error.contains("touch HAL rejected required modes") {
+        4
+    } else if error.contains("THP runtime verify failed") {
+        3
+    } else if error.contains("THP timing block not found")
+        || error.contains("libtouchreport_hal.so is not mapped")
+        || error.contains("touch service process not found")
+        || error.contains("THP configuration verify failed")
+    {
+        2
+    } else if error.contains("TouchFeature HAL unavailable")
+        || error.contains("requires the Dash vendor touch HAL")
+    {
+        1
+    } else {
+        5
+    }
+}
+
+fn record_touch_diagnostic(error: &str) {
+    // The keepalive re-applies the profile on every wake, so the same failure
+    // arrives in a loop. Log it only when the reason actually changes.
+    let changed = touch_last_error()
+        .lock()
+        .map(|mut slot| {
+            if slot.as_str() == error {
+                false
+            } else {
+                slot.clear();
+                slot.push_str(error);
+                true
+            }
+        })
+        .unwrap_or(true);
+    TOUCH_ERROR_CODE.store(touch_error_code_for(error), Ordering::Release);
+    if changed {
+        eprintln!("DASH_TOUCH_APPLY_FAIL {error}");
+    }
+}
+
+fn clear_touch_diagnostic() {
+    TOUCH_ERROR_CODE.store(0, Ordering::Release);
+    if let Ok(mut slot) = touch_last_error().lock() {
+        slot.clear();
+    }
+}
+
 fn set_touch_profile(profile: i32) -> Result<(), String> {
     if profile == 0 {
         return release_touch_control();
@@ -2601,6 +2684,15 @@ fn set_touch_profile(profile: i32) -> Result<(), String> {
 }
 
 fn apply_touch_profile_locked(profile: i32) -> Result<(), String> {
+    let result = apply_touch_profile_locked_inner(profile);
+    match &result {
+        Ok(()) => clear_touch_diagnostic(),
+        Err(error) => record_touch_diagnostic(error),
+    }
+    result
+}
+
+fn apply_touch_profile_locked_inner(profile: i32) -> Result<(), String> {
     service_control::remember("touch.hal", serde_json::json!(true))?;
 
     TOUCH_APPLY_ACK.store(0, Ordering::Release);
@@ -2613,10 +2705,21 @@ fn apply_touch_profile_locked(profile: i32) -> Result<(), String> {
         let resampled = profile == 3;
         let vendor_profile = if resampled { 2 } else { profile };
         let locked_rate = touch_profile_locked_rate(profile);
-        let layout_and_expected_rate = locked_rate
-            .map(write_touch_thp_rate)
-            .transpose()?
-            .map(|layout| (layout, locked_rate.unwrap_or_default()));
+        // Dash's libtouchreport_hal.so does not carry the Rodin in-memory THP
+        // timing block, so this memory patch is optional here: the vendor
+        // TouchFeature HAL is what actually selects 240/480 Hz on this panel.
+        // A missing block must not gate the profile; the reason is surfaced
+        // through `touch_error`/`touch_error_code` instead.
+        let layout_and_expected_rate = match locked_rate {
+            Some(rate) => match write_touch_thp_rate(rate) {
+                Ok(layout) => Some((layout, rate)),
+                Err(error) => {
+                    eprintln!("DASH_TOUCH_THP_UNAVAILABLE {error}");
+                    None
+                }
+            },
+            None => None,
+        };
         apply_touch_hal_profile(vendor_profile)?;
 
         if let Some((layout, expected_rate)) = layout_and_expected_rate {
@@ -2821,6 +2924,8 @@ static PERFORMANCE_PROFILE_OK: AtomicI32 = AtomicI32::new(-1);
 static PERSISTENCE_LOADED: AtomicI32 = AtomicI32::new(0);
 static DISPLAY_APPLY_ACK: AtomicI32 = AtomicI32::new(-1);
 static TOUCH_APPLY_ACK: AtomicI32 = AtomicI32::new(-1);
+static TOUCH_ERROR_CODE: AtomicI32 = AtomicI32::new(0);
+static TOUCH_LAST_ERROR: OnceLock<Mutex<String>> = OnceLock::new();
 static KEEPALIVE_APPLY_ACK: AtomicI32 = AtomicI32::new(-1);
 static KEEPALIVE_APPLY_COUNT: AtomicI32 = AtomicI32::new(0);
 static CPU_WRITE_ACK: AtomicI32 = AtomicI32::new(-1);
@@ -5995,6 +6100,8 @@ fn snapshot_persistence_fields() -> Vec<String> {
         ),
         format!("display_ack={}", DISPLAY_APPLY_ACK.load(Ordering::Acquire)),
         format!("touch_ack={}", TOUCH_APPLY_ACK.load(Ordering::Acquire)),
+        format!("touch_error_code={}", TOUCH_ERROR_CODE.load(Ordering::Acquire)),
+        format!("touch_error={}", snapshot_safe_text(&touch_error_text())),
         format!("cpu_manual={}", state.cpu_manual),
         format!("cpu_saved_mask={}", state.cpu_online_mask | 0x01),
         format!("cpu_write_ack={}", CPU_WRITE_ACK.load(Ordering::Acquire)),
@@ -7098,7 +7205,8 @@ mod tests {
         opp_index_for_freq_mhz, opp_index_stepped_by_levels, package_app_id_from_packages_list,
         parse_cpu_frequency_table, parse_cpu_time_in_state, parse_ged_current_frequency_mhz,
         parse_gpufreq_opp_table, persisted_cpu_ranges_active, profile_uses_ged_boost,
-        scaled_display_density, tcp_client_uid_from_table, touch_hal_profile_sequence,
+        scaled_display_density, snapshot_safe_text, tcp_client_uid_from_table,
+        touch_error_code_for, touch_hal_profile_sequence,
         valid_charging_profile, valid_mi_thermal_config_mode, validate_cpu_frequency_range_against,
     };
 
@@ -7427,6 +7535,28 @@ posdiv: 0, margin:     0, power:     0\n";
         put_u16(&mut bytes, offset + 0x28, 650);
 
         assert_eq!(find_touch_thp_config_offset(&bytes), Some(offset));
+    }
+
+    #[test]
+    fn touch_error_code_maps_to_known_labels() {
+        assert_eq!(touch_error_code_for("touch HAL rejected required modes"), 4);
+        assert_eq!(touch_error_code_for("THP runtime verify failed"), 3);
+        assert_eq!(touch_error_code_for("THP timing block not found"), 2);
+        assert_eq!(touch_error_code_for("libtouchreport_hal.so is not mapped"), 2);
+        assert_eq!(touch_error_code_for("TouchFeature HAL unavailable"), 1);
+        assert_eq!(touch_error_code_for("something unexpected"), 5);
+    }
+
+    #[test]
+    fn snapshot_safe_text_keeps_paths_and_strips_separators() {
+        // Paths and punctuation stay readable; only the snapshot separator and
+        // line breaks are replaced so one field cannot forge another.
+        let s = snapshot_safe_text("touch service maps: /proc/1234/mem; io=0\nok");
+        assert!(s.contains("touch service maps: /proc/1234/mem"));
+        assert!(!s.contains(';'));
+        assert!(!s.contains('\n'));
+
+        assert_eq!(snapshot_safe_text(&"e".repeat(500)).len(), 120);
     }
 
     #[test]

@@ -780,6 +780,7 @@ fn refresh(cache: &Cache) -> Result<(), String> {
         ("sunlight_saved", 27),
         ("display_ack", 28),
         ("touch_ack", 29),
+        ("touch_error_code", 30),
         ("runtime_keepalive_ack", 32),
         ("runtime_keepalive_count", 33),
         ("cpu_manual", 34),

@@ -4366,6 +4366,20 @@ String _dashTouchLabel(int profile) {
   };
 }
 
+/// Human-readable cause for a failed touch apply, mirroring the daemon's
+/// `touch_error_code` so the diagnostics page explains why the bridge is not
+/// ready instead of showing a bare "Failed".
+String _touchErrorLabel(int code) {
+  return switch (code) {
+    1 => 'vendor touch HAL unreachable',
+    2 => 'touch timing block not found',
+    3 => 'report-rate verify mismatch',
+    4 => 'HAL rejected required modes',
+    5 => 'unexpected apply error',
+    _ => 'no detail reported',
+  };
+}
+
 class HubsScreen extends StatelessWidget {
   const HubsScreen({required this.onOpen, super.key});
 
@@ -5190,9 +5204,9 @@ class SupportScreen extends StatelessWidget {
 
         // GitHub Card
         _CommunityCard(
-          title: 'GitHub Repository',
-          subtitle: 'Star, fork, and inspect the open-source code',
-          badge: 'NEESCHAL-3',
+          title: 'Dash Essential Repository',
+          subtitle: 'Star, fork, and inspect this MT6991 port',
+          badge: 'afrizal1211',
           iconWidget: GithubIcon(color: colors.primary, size: 22),
           accent: colors.primary,
           onTap: () => _openLink(0),
@@ -5203,7 +5217,7 @@ class SupportScreen extends StatelessWidget {
         _CommunityCard(
           title: 'Telegram Community',
           subtitle: 'Join device discussions, chat & get instant support',
-          badge: '@PocoX7ProNepalChat',
+          badge: '@POCOX8ProMaxID',
           iconWidget: const Icon(
             Icons.send_rounded,
             size: 20,
@@ -5211,6 +5225,17 @@ class SupportScreen extends StatelessWidget {
           ),
           accent: const Color(0xFF26A5E4),
           onTap: () => _openLink(1),
+        ),
+        const SizedBox(height: 8),
+
+        // Upstream source Card
+        _CommunityCard(
+          title: 'Upstream Source',
+          subtitle: 'Rodin Essential by NEESCHAL-3, Apache-2.0',
+          badge: 'NEESCHAL-3',
+          iconWidget: GithubIcon(color: colors.secondary, size: 22),
+          accent: colors.secondary,
+          onTap: () => _openLink(2),
         ),
 
         const SizedBox(height: 16),
@@ -7037,6 +7062,7 @@ class _TouchBoostScreenState extends State<TouchBoostScreen> {
         final int activeProfile = _pendingProfile ?? savedProfile;
         final Color accent = _profileAccent(activeProfile);
         final int touchAck = backend.extendedValue(29);
+        final int touchErrorCode = backend.extendedValue(30);
         final int panelCode = backend.extendedValue(62);
         final int controlPath = backend.extendedValue(63);
         final String panel = switch (panelCode) {
@@ -7054,6 +7080,22 @@ class _TouchBoostScreenState extends State<TouchBoostScreen> {
         final bool applying =
             _pendingProfile != null && savedProfile != _pendingProfile;
         final bool oemManaged = activeProfile == 0 && !applying;
+        final bool touchFailed =
+            !applying && activeProfile != 0 && touchAck == 0;
+        final String stateTitle = oemManaged
+            ? 'OEM-managed touch'
+            : !applying && touchAck == 1
+            ? 'Profile persisted'
+            : touchFailed
+            ? 'Touch pipeline rejected'
+            : 'Applying touch pipeline';
+        final String stateDetail = oemManaged
+            ? 'No Dash Essential fixed-rate profile is active. Your ROM manages touch timing.'
+            : !applying && touchAck == 1
+            ? 'Reasserted after boot, screen wake, and vendor resets'
+            : touchFailed
+            ? 'Reason: ${_touchErrorLabel(touchErrorCode)}'
+            : 'Waiting for the panel HAL to confirm every required mode';
         final bool controlsEnabled =
             snapshot.controlsAvailable &&
             snapshot.touchHal == 1 &&
@@ -7109,11 +7151,7 @@ class _TouchBoostScreenState extends State<TouchBoostScreen> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: <Widget>[
                         Text(
-                          oemManaged
-                              ? 'OEM-managed touch'
-                              : !applying && touchAck == 1
-                              ? 'Profile persisted'
-                              : 'Applying touch pipeline',
+                          stateTitle,
                           style: const TextStyle(
                             fontSize: 14.5,
                             fontWeight: FontWeight.w700,
@@ -7121,11 +7159,7 @@ class _TouchBoostScreenState extends State<TouchBoostScreen> {
                         ),
                         const SizedBox(height: 3),
                         Text(
-                          oemManaged
-                              ? 'No Dash Essential fixed-rate profile is active. Your ROM manages touch timing.'
-                              : !applying && touchAck == 1
-                              ? 'Reasserted after boot, screen wake, and vendor resets'
-                              : 'Waiting for the panel HAL to confirm every required mode',
+                          stateDetail,
                           style: TextStyle(
                             fontSize: 11.5,
                             height: 1.25,
@@ -13232,6 +13266,7 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
         final int persistence = backend.extendedValue(26);
         final int displayAck = backend.extendedValue(28);
         final int touchAck = backend.extendedValue(29);
+        final int touchErrorCode = backend.extendedValue(30);
 
         final List<int> drifts = <int>[
           backend.extendedValue(14),
@@ -13341,7 +13376,7 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
                     detail: touchAck == 1
                         ? 'Ready'
                         : touchAck == 0
-                        ? 'Failed'
+                        ? 'Failed: ${_touchErrorLabel(touchErrorCode)}'
                         : 'Active',
                   ),
                 ],

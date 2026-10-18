@@ -529,8 +529,12 @@ pub extern "C" fn dash_host_haptic_ready() -> i32 {
 
 pub fn dash_host_open_url_jni(code: i32) -> bool {
     let url = match code {
-        0 => "https://github.com/NEESCHAL-3",
-        1 => "https://t.me/PocoX7ProNepalChat",
+        // Maintained Dash Essential MT6991 port.
+        0 => "https://github.com/afrizal1211/dash-essentials",
+        // Dash Essential community.
+        1 => "https://t.me/POCOX8ProMaxID",
+        // Upstream project this port is derived from.
+        2 => "https://github.com/NEESCHAL-3/Rodin-Essential",
         _ => return false,
     };
 
