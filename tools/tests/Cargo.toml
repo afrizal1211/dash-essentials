@@ -1,0 +1,18 @@
+[package]
+name = "dash-bridge-host-tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# The harness stubs `dash_host_open_url_jni` and pulls in backend_bridge.rs so
+# its native protocol and cache tests run on a host without Android or Flutter.
+# backend_bridge.rs is Unix-only, so this manifest is a Unix host path, unlike
+# the palette harness in tools/system-colors-host-tests.
+[lib]
+path = "system-colors-host.rs"
+
+[dependencies]
+serde_json = "1.0"
+
+# Keep this host-only harness independent from the Android/Unix workspace.
+[workspace]

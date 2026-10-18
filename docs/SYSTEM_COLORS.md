@@ -189,6 +189,11 @@ cd ui/flutter
 flutter test
 ```
 
+`tools/test-system-colors.sh` also runs the native protocol and cache tests in
+`runtime/host-rust/src/backend_bridge.rs`. That file is Unix-only and resolves
+`serde_json`, so it is driven through `tools/tests/Cargo.toml` rather than a
+bare `rustc --test`, and it needs a Unix host.
+
 Tests cover Android 12 and Android 13+ JSON contracts, JSON preservation, reset,
 input/style validation, strict native regeneration readback,
 idempotency, rollback, concurrent picker changes, native protocol/cache mapping,
