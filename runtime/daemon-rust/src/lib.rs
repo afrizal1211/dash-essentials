@@ -1188,7 +1188,7 @@ fn policy_governor(policy: i32) -> String {
 }
 
 fn gpu_governor() -> String {
-    read_trimmed("/sys/class/devfreq/13000000.mali/governor").unwrap_or_else(|_| "unknown".into())
+    read_trimmed("/sys/class/devfreq/48000000.mali/governor").unwrap_or_else(|_| "unknown".into())
 }
 
 fn scheduler_name(path: &Path) -> Option<String> {
@@ -1286,9 +1286,9 @@ fn set_cpu_governor(policy: i32, governor: &str) -> Result<(), String> {
 
 fn cpu_policy_default_range(policy: i32) -> Option<(i32, i32)> {
     match policy {
-        0 => Some((300, 2100)),
-        4 => Some((400, 3000)),
-        7 => Some((1000, 3250)),
+        0 => Some((339, 2400)),
+        4 => Some((622, 3300)),
+        7 => Some((798, 3730)),
         _ => None,
     }
 }
@@ -1618,7 +1618,7 @@ fn apply_cluster_freq_controls_unlocked(
             "MI thermal CPU limit",
         )?;
 
-        // MT6899 accepts one policy leader plus its minimum and maximum in
+        // MT6991 accepts one policy leader plus its minimum and maximum in
         // kHz. This updates only the selected policy; it does not replace the
         // frequency table for either of the other CPU clusters.
         write_optional_cpu_control(
@@ -1809,7 +1809,7 @@ fn set_gpu_governor(governor: &str) -> Result<(), String> {
     if !SAFE.contains(&governor) {
         return Err("invalid gpu governor request".into());
     }
-    let path = Path::new("/sys/class/misc/mali0/device/devfreq/13000000.mali/governor");
+    let path = Path::new("/sys/class/misc/mali0/device/devfreq/48000000.mali/governor");
     let actual = write_verified(path, governor)?;
     if actual == governor {
         mutate_persisted_state(|state| {
@@ -1883,46 +1883,46 @@ fn write_beast_gpu_constraints() {
     let _ = service_control::write("/sys/module/ged/parameters/ged_smart_boost", "1");
     let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "0");
     let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "0");
-    let _ = service_control::write("/sys/module/ged/parameters/gpu_bottom_freq", "1300000");
-    let _ = service_control::write("/sys/module/ged/parameters/gpu_cust_boost_freq", "1300000");
+    let _ = service_control::write("/sys/module/ged/parameters/gpu_bottom_freq", "1612000");
+    let _ = service_control::write("/sys/module/ged/parameters/gpu_cust_boost_freq", "1612000");
     let _ = service_control::write(
         "/sys/module/ged/parameters/gpu_cust_upbound_freq",
-        "1300000",
+        "1612000",
     );
     let _ = gpu_write_file(
-        "/sys/class/devfreq/13000000.mali/max_freq",
-        "/sys/class/misc/mali0/device/devfreq/13000000.mali/max_freq",
-        "1300000000",
+        "/sys/class/devfreq/48000000.mali/max_freq",
+        "/sys/class/misc/mali0/device/devfreq/48000000.mali/max_freq",
+        "1612000000",
     );
     let _ = gpu_write_file(
-        "/sys/class/devfreq/13000000.mali/min_freq",
-        "/sys/class/misc/mali0/device/devfreq/13000000.mali/min_freq",
-        "1300000000",
+        "/sys/class/devfreq/48000000.mali/min_freq",
+        "/sys/class/misc/mali0/device/devfreq/48000000.mali/min_freq",
+        "1612000000",
     );
     let _ = gpu_write_file(
-        "/sys/class/devfreq/13000000.mali/governor",
-        "/sys/class/misc/mali0/device/devfreq/13000000.mali/governor",
+        "/sys/class/devfreq/48000000.mali/governor",
+        "/sys/class/misc/mali0/device/devfreq/48000000.mali/governor",
         "performance",
     );
 }
 
 // Beast must never disable DVFS while the GPU is still running a previous
 // OPP. This is especially important during boot: the MediaTek power service
-// can publish its stock OPP 40 target after sys.boot_completed, and freezing
-// DVFS at that point leaves the GPU stuck below 1300 MHz until the UI submits
+// can publish its stock OPP 49 target after sys.boot_completed, and freezing
+// DVFS at that point leaves the GPU stuck below 1612 MHz until the UI submits
 // another profile command. Keep DVFS enabled while arming OPP 0, and disable
-// it only after the live GED frequency confirms 1300 MHz.
+// it only after the live GED frequency confirms 1612 MHz.
 fn arm_or_lock_beast_gpu() -> bool {
     write_beast_gpu_constraints();
 
-    if gpu_get_cur_freq_mhz() != 1300 {
+    if gpu_get_cur_freq_mhz() != 1612 {
         let _ = service_control::write("/sys/module/ged/parameters/gpu_dvfs_enable", "1");
         let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "0");
         return false;
     }
 
     let _ = service_control::write("/sys/module/ged/parameters/gpu_dvfs_enable", "0");
-    gpu_get_cur_freq_mhz() == 1300 && gpu_get_dvfs_enabled() == 0
+    gpu_get_cur_freq_mhz() == 1612 && gpu_get_dvfs_enabled() == 0
 }
 
 fn settle_beast_gpu_lock(attempts: usize, delay: Duration) -> bool {
@@ -1949,7 +1949,7 @@ pub fn enforce_performance_profile(profile: i32) -> bool {
 
     match profile {
         3 => {
-            // Extreme Beast: fixed 1300 MHz OPP with the GPU cooling cap
+            // Extreme Beast: fixed 1612 MHz OPP with the GPU cooling cap
             // explicitly disabled for this unrestricted profile.
             let _ = settle_beast_gpu_lock(60, Duration::from_millis(25));
         }
@@ -1958,28 +1958,28 @@ pub fn enforce_performance_profile(profile: i32) -> bool {
             // load-based governor, with GED and zero-latency power enabled.
             let _ = service_control::write("/sys/module/ged/parameters/gpu_dvfs_enable", "1");
             let _ = gpu_write_file(
-                "/sys/class/devfreq/13000000.mali/max_freq",
-                "/sys/class/misc/mali0/device/devfreq/13000000.mali/max_freq",
-                "1300000000",
+                "/sys/class/devfreq/48000000.mali/max_freq",
+                "/sys/class/misc/mali0/device/devfreq/48000000.mali/max_freq",
+                "1612000000",
             );
             let _ = gpu_write_file(
-                "/sys/class/devfreq/13000000.mali/min_freq",
-                "/sys/class/misc/mali0/device/devfreq/13000000.mali/min_freq",
-                "260000000",
+                "/sys/class/devfreq/48000000.mali/min_freq",
+                "/sys/class/misc/mali0/device/devfreq/48000000.mali/min_freq",
+                "338000000",
             );
             let _ = gpu_write_file(
-                "/sys/class/devfreq/13000000.mali/governor",
-                "/sys/class/misc/mali0/device/devfreq/13000000.mali/governor",
+                "/sys/class/devfreq/48000000.mali/governor",
+                "/sys/class/misc/mali0/device/devfreq/48000000.mali/governor",
                 "simple_ondemand",
             );
-            let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "40");
+            let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "49");
             let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "0");
-            let _ = service_control::write("/sys/module/ged/parameters/gpu_bottom_freq", "260000");
+            let _ = service_control::write("/sys/module/ged/parameters/gpu_bottom_freq", "338000");
             let _ =
-                service_control::write("/sys/module/ged/parameters/gpu_cust_boost_freq", "260000");
+                service_control::write("/sys/module/ged/parameters/gpu_cust_boost_freq", "338000");
             let _ = service_control::write(
                 "/sys/module/ged/parameters/gpu_cust_upbound_freq",
-                "1300000",
+                "1612000",
             );
             let _ =
                 service_control::write("/sys/class/misc/mali0/device/power_policy", "always_on");
@@ -1992,25 +1992,25 @@ pub fn enforce_performance_profile(profile: i32) -> bool {
             // Battery Saver: lowest governor with a 598 MHz hard ceiling.
             let _ = service_control::write("/sys/module/ged/parameters/gpu_dvfs_enable", "1");
             let _ = gpu_write_file(
-                "/sys/class/devfreq/13000000.mali/min_freq",
-                "/sys/class/misc/mali0/device/devfreq/13000000.mali/min_freq",
-                "260000000",
+                "/sys/class/devfreq/48000000.mali/min_freq",
+                "/sys/class/misc/mali0/device/devfreq/48000000.mali/min_freq",
+                "338000000",
             );
             let _ = gpu_write_file(
-                "/sys/class/devfreq/13000000.mali/max_freq",
-                "/sys/class/misc/mali0/device/devfreq/13000000.mali/max_freq",
+                "/sys/class/devfreq/48000000.mali/max_freq",
+                "/sys/class/misc/mali0/device/devfreq/48000000.mali/max_freq",
                 "598000000",
             );
             let _ = gpu_write_file(
-                "/sys/class/devfreq/13000000.mali/governor",
-                "/sys/class/misc/mali0/device/devfreq/13000000.mali/governor",
+                "/sys/class/devfreq/48000000.mali/governor",
+                "/sys/class/misc/mali0/device/devfreq/48000000.mali/governor",
                 "powersave",
             );
-            let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "40");
-            let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "27");
-            let _ = service_control::write("/sys/module/ged/parameters/gpu_bottom_freq", "260000");
+            let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "49");
+            let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "39");
+            let _ = service_control::write("/sys/module/ged/parameters/gpu_bottom_freq", "338000");
             let _ =
-                service_control::write("/sys/module/ged/parameters/gpu_cust_boost_freq", "260000");
+                service_control::write("/sys/module/ged/parameters/gpu_cust_boost_freq", "338000");
             let _ = service_control::write(
                 "/sys/module/ged/parameters/gpu_cust_upbound_freq",
                 "598000",
@@ -2029,28 +2029,28 @@ pub fn enforce_performance_profile(profile: i32) -> bool {
             // stock governor is `dummy`; the vendor service then owns live caps.
             let _ = service_control::write("/sys/module/ged/parameters/gpu_dvfs_enable", "1");
             let _ = gpu_write_file(
-                "/sys/class/devfreq/13000000.mali/max_freq",
-                "/sys/class/misc/mali0/device/devfreq/13000000.mali/max_freq",
-                "1300000000",
+                "/sys/class/devfreq/48000000.mali/max_freq",
+                "/sys/class/misc/mali0/device/devfreq/48000000.mali/max_freq",
+                "1612000000",
             );
             let _ = gpu_write_file(
-                "/sys/class/devfreq/13000000.mali/min_freq",
-                "/sys/class/misc/mali0/device/devfreq/13000000.mali/min_freq",
-                "260000000",
+                "/sys/class/devfreq/48000000.mali/min_freq",
+                "/sys/class/misc/mali0/device/devfreq/48000000.mali/min_freq",
+                "338000000",
             );
             let _ = gpu_write_file(
-                "/sys/class/devfreq/13000000.mali/governor",
-                "/sys/class/misc/mali0/device/devfreq/13000000.mali/governor",
+                "/sys/class/devfreq/48000000.mali/governor",
+                "/sys/class/misc/mali0/device/devfreq/48000000.mali/governor",
                 "dummy",
             );
-            let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "40");
+            let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "49");
             let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "0");
-            let _ = service_control::write("/sys/module/ged/parameters/gpu_bottom_freq", "260000");
+            let _ = service_control::write("/sys/module/ged/parameters/gpu_bottom_freq", "338000");
             let _ =
-                service_control::write("/sys/module/ged/parameters/gpu_cust_boost_freq", "260000");
+                service_control::write("/sys/module/ged/parameters/gpu_cust_boost_freq", "338000");
             let _ = service_control::write(
                 "/sys/module/ged/parameters/gpu_cust_upbound_freq",
-                "1300000",
+                "1612000",
             );
             let _ = service_control::write(
                 "/sys/class/misc/mali0/device/power_policy",
@@ -2086,8 +2086,8 @@ pub fn apply_performance_profile(profile: i32) -> Result<(), String> {
         3 => mutate_persisted_state(|state| {
             state.perf = 3;
             state.gpu_uncap = 1;
-            state.gpu_min_freq_mhz = 1300;
-            state.gpu_max_freq_mhz = 1300;
+            state.gpu_min_freq_mhz = 1612;
+            state.gpu_max_freq_mhz = 1612;
             state.gpu_ged_boost = 1;
             state.gpu = "performance".to_string();
             state.gpu_governor = "performance".to_string();
@@ -2097,8 +2097,8 @@ pub fn apply_performance_profile(profile: i32) -> Result<(), String> {
         1 => mutate_persisted_state(|state| {
             state.perf = 1;
             state.gpu_uncap = 0;
-            state.gpu_min_freq_mhz = 260;
-            state.gpu_max_freq_mhz = 1300;
+            state.gpu_min_freq_mhz = 338;
+            state.gpu_max_freq_mhz = 1612;
             state.gpu_ged_boost = 1;
             state.gpu = "simple_ondemand".to_string();
             state.gpu_governor = "simple_ondemand".to_string();
@@ -2108,7 +2108,7 @@ pub fn apply_performance_profile(profile: i32) -> Result<(), String> {
         2 => mutate_persisted_state(|state| {
             state.perf = 2;
             state.gpu_uncap = 0;
-            state.gpu_min_freq_mhz = 260;
+            state.gpu_min_freq_mhz = 338;
             state.gpu_max_freq_mhz = 598;
             state.gpu_ged_boost = 0;
             state.gpu = "powersave".to_string();
@@ -2876,8 +2876,8 @@ impl Default for PersistedState {
             zram_size_mb: 8192,
             zram_algorithm: "lz4".to_string(),
             zram_swappiness: 100,
-            gpu_min_freq_mhz: 260,
-            gpu_max_freq_mhz: 1300,
+            gpu_min_freq_mhz: 338,
+            gpu_max_freq_mhz: 1612,
             gpu_governor: "simple_ondemand".to_string(),
             gpu_ged_boost: 0,
             gpu_uncap: 0,
@@ -2908,6 +2908,9 @@ fn legacy_gpu_profile_cpu_signature(state: &PersistedState) -> bool {
         state.cpu_max_freq7,
     );
 
+    // These signatures describe state written by *legacy* builds (before the
+    // GPU/CPU profile isolation marker). They intentionally keep the historic
+    // MT6899/Rodin values so old state files are still recognised and migrated.
     match state.perf {
         3 => {
             governors == ("performance", "performance", "performance")
@@ -2953,13 +2956,13 @@ fn migrate_legacy_gpu_profile_cpu_state(state: &mut PersistedState) -> bool {
 
 fn restore_vendor_cpu_defaults() {
     for policy in [0, 4, 7] {
-        if set_cpu_governor(policy, "sugov_ext").is_err() {
-            let _ = set_cpu_governor(policy, "schedutil");
+        if set_cpu_governor(policy, "schedutil").is_err() {
+            let _ = set_cpu_governor(policy, "sugov_ext");
         }
     }
-    let _ = apply_cluster_freq_controls(0, 300, 2100);
-    let _ = apply_cluster_freq_controls(4, 400, 3000);
-    let _ = apply_cluster_freq_controls(7, 1000, 3250);
+    let _ = apply_cluster_freq_controls(0, 339, 2400);
+    let _ = apply_cluster_freq_controls(4, 622, 3300);
+    let _ = apply_cluster_freq_controls(7, 798, 3730);
 }
 
 static PERSISTED_STATE: OnceLock<Mutex<PersistedState>> = OnceLock::new();
@@ -3738,7 +3741,7 @@ fn parse_number_after(line: &str, key: &str) -> Option<f64> {
 }
 
 fn scaled_display_density(native_density: i32, width: i32) -> i32 {
-    (native_density * width + 610) / 1220
+    (native_density * width + 640) / 1280
 }
 
 fn refresh_display_info() {
@@ -3904,12 +3907,12 @@ fn apply_display_resolution(
     persist: bool,
 ) -> Result<(), String> {
     capture_window_originals()?;
-    let native = width <= 0 || height <= 0 || (width == 1220 && height == 2712);
+    let native = width <= 0 || height <= 0 || (width == 1280 && height == 2772);
     let detected_density = DISPLAY_NATIVE_DENSITY.load(Ordering::Acquire);
     let native_density = if detected_density > 0 {
         detected_density
     } else {
-        520
+        504
     };
     let target_density = if native {
         native_density
@@ -3947,8 +3950,8 @@ fn apply_display_resolution(
         run_wm(&["density", &density])?;
     }
 
-    let expected_width = if native { 1220 } else { width };
-    let expected_height = if native { 2712 } else { height };
+    let expected_width = if native { 1280 } else { width };
+    let expected_height = if native { 2772 } else { height };
     let mut verified = false;
     for _ in 0..4 {
         std::thread::sleep(Duration::from_millis(35));
@@ -4287,12 +4290,12 @@ fn restore_persisted_state() {
             let min = if state.cpu_min_freq0 > 0 {
                 state.cpu_min_freq0
             } else {
-                300
+                339
             };
             let max = if state.cpu_max_freq0 > 0 {
                 state.cpu_max_freq0
             } else {
-                2100
+                2400
             };
             let _ = apply_cluster_freq_controls(0, min, max);
         }
@@ -4300,12 +4303,12 @@ fn restore_persisted_state() {
             let min = if state.cpu_min_freq4 > 0 {
                 state.cpu_min_freq4
             } else {
-                400
+                622
             };
             let max = if state.cpu_max_freq4 > 0 {
                 state.cpu_max_freq4
             } else {
-                3000
+                3300
             };
             let _ = apply_cluster_freq_controls(4, min, max);
         }
@@ -4313,12 +4316,12 @@ fn restore_persisted_state() {
             let min = if state.cpu_min_freq7 > 0 {
                 state.cpu_min_freq7
             } else {
-                1000
+                798
             };
             let max = if state.cpu_max_freq7 > 0 {
                 state.cpu_max_freq7
             } else {
-                3250
+                3730
             };
             let _ = apply_cluster_freq_controls(7, min, max);
         }
@@ -4449,7 +4452,7 @@ fn reassert_persisted_governors() {
 
         if state.gpu_uncap == 1 {
             // Do not freeze a lower boot OPP. This step leaves DVFS enabled
-            // until the live frequency reaches 1300 MHz, then locks it.
+            // until the live frequency reaches 1612 MHz, then locks it.
             let _ = arm_or_lock_beast_gpu();
         } else if gpu_get_dvfs_enabled() != 1 {
             let _ = service_control::write("/sys/module/ged/parameters/gpu_dvfs_enable", "1");
@@ -4595,11 +4598,11 @@ fn gaming_dynamic_guard() {
 
         // Gaming and Beast own only the Mali cooling device. The vendor thermal
         // services remain running for CPU and platform management while this
-        // guard prevents a GPU cooling cap from replacing their 1300 MHz target.
+        // guard prevents a GPU cooling cap from replacing their 1612 MHz target.
         let _ = service_control::write("/sys/class/thermal/cooling_device3/cur_state", "0");
 
         if profile == 3 {
-            // MediaTek's power HAL can publish its stock OPP 40 target after
+            // MediaTek's power HAL can publish its stock OPP 49 target after
             // boot completion. Reassert every Beast-owned node and lock DVFS
             // only after GED confirms that OPP 0 is actually live.
             let _ = arm_or_lock_beast_gpu();
@@ -4613,7 +4616,7 @@ fn gaming_dynamic_guard() {
         smoothed_load = ((smoothed_load * 3) + load) / 4;
         let now = Instant::now();
 
-        // The MT6899 accepts the generic simple_ondemand governor name but
+        // The MT6991 accepts the generic simple_ondemand governor name but
         // does not drive the MediaTek GED OPP policy from it. GED's custom
         // boost node is an OPP floor (0 = fastest, last = slowest), so use it
         // as the real on-demand actuator while retaining the requested
@@ -5213,7 +5216,7 @@ fn gpu_get_cur_opp_index() -> i32 {
                 .next()
                 .and_then(|part| part.parse::<i32>().ok())
         })
-        .unwrap_or(40)
+        .unwrap_or(51)
 }
 
 fn gpu_get_lowest_opp_index() -> i32 {
@@ -5226,10 +5229,10 @@ fn gpu_get_lowest_opp_index() -> i32 {
         })
         .map(|count| count.saturating_sub(1))
         .or_else(|| {
-            gpu_read_raw("/sys/class/devfreq/13000000.mali/available_frequencies")
+            gpu_read_raw("/sys/class/devfreq/48000000.mali/available_frequencies")
                 .map(|value| value.split_whitespace().count().saturating_sub(1) as i32)
         })
-        .unwrap_or(40)
+        .unwrap_or(51)
         .clamp(0, 255)
 }
 
@@ -5274,7 +5277,7 @@ fn parse_ged_current_frequency_mhz(raw: &str) -> Option<i32> {
 }
 
 fn gpu_get_cur_freq_mhz() -> i32 {
-    // MediaTek GED reports the active OPP (for example `40 260000`). The
+    // MediaTek GED reports the active OPP (for example `51 338000`). The
     // generic devfreq node can expose a 26 MHz deep-idle clock instead, which
     // is useful for power debugging but not the live OPP selected by GED.
     if let Some(mhz) = gpu_read_raw("/sys/kernel/ged/hal/current_freqency")
@@ -5284,8 +5287,8 @@ fn gpu_get_cur_freq_mhz() -> i32 {
         return mhz;
     }
 
-    gpu_read_raw("/sys/class/devfreq/13000000.mali/cur_freq")
-        .or_else(|| gpu_read_raw("/sys/class/misc/mali0/device/devfreq/13000000.mali/cur_freq"))
+    gpu_read_raw("/sys/class/devfreq/48000000.mali/cur_freq")
+        .or_else(|| gpu_read_raw("/sys/class/misc/mali0/device/devfreq/48000000.mali/cur_freq"))
         .and_then(|s| s.trim().parse::<i64>().ok())
         .filter(|hz| *hz > 0)
         .map(|hz| (hz / 1_000_000) as i32)
@@ -5294,18 +5297,18 @@ fn gpu_get_cur_freq_mhz() -> i32 {
 
 fn gpu_get_min_freq_mhz() -> i32 {
     gpu_read_file(
-        "/sys/class/devfreq/13000000.mali/min_freq",
-        "/sys/class/misc/mali0/device/devfreq/13000000.mali/min_freq",
+        "/sys/class/devfreq/48000000.mali/min_freq",
+        "/sys/class/misc/mali0/device/devfreq/48000000.mali/min_freq",
     )
     .and_then(|s| s.trim().parse::<i64>().ok())
     .map(|hz| (hz / 1_000_000) as i32)
-    .unwrap_or(260)
+    .unwrap_or(338)
 }
 
 fn gpu_get_max_freq_mhz() -> i32 {
     gpu_read_file(
-        "/sys/class/devfreq/13000000.mali/max_freq",
-        "/sys/class/misc/mali0/device/devfreq/13000000.mali/max_freq",
+        "/sys/class/devfreq/48000000.mali/max_freq",
+        "/sys/class/misc/mali0/device/devfreq/48000000.mali/max_freq",
     )
     .and_then(|s| s.trim().parse::<i64>().ok())
     .map(|hz| (hz / 1_000_000) as i32)
@@ -5314,8 +5317,8 @@ fn gpu_get_max_freq_mhz() -> i32 {
 
 fn gpu_get_governor() -> String {
     gpu_read_file(
-        "/sys/class/devfreq/13000000.mali/governor",
-        "/sys/class/misc/mali0/device/devfreq/13000000.mali/governor",
+        "/sys/class/devfreq/48000000.mali/governor",
+        "/sys/class/misc/mali0/device/devfreq/48000000.mali/governor",
     )
     .map(|s| s.trim().to_string())
     .unwrap_or_else(|| "simple_ondemand".to_string())
@@ -5368,9 +5371,9 @@ fn gpu_get_dvfs_enabled() -> i32 {
 }
 
 fn gpu_get_uncap_active() -> i32 {
-    if gpu_get_min_freq_mhz() == 1300
-        && gpu_get_max_freq_mhz() == 1300
-        && gpu_get_cur_freq_mhz() == 1300
+    if gpu_get_min_freq_mhz() == 1612
+        && gpu_get_max_freq_mhz() == 1612
+        && gpu_get_cur_freq_mhz() == 1612
         && gpu_get_governor() == "performance"
         && gpu_get_dvfs_enabled() == 0
         && gpu_get_power_policy() == "always_on"
@@ -5390,24 +5393,24 @@ fn gpu_profile_verified(profile: i32) -> bool {
 
     match profile {
         3 => {
-            min == 1300
-                && max == 1300
-                && gpu_get_cur_freq_mhz() == 1300
+            min == 1612
+                && max == 1612
+                && gpu_get_cur_freq_mhz() == 1612
                 && governor == "performance"
                 && gpu_boost_pipeline_matches(true)
                 && dvfs == 0
                 && power_policy == "always_on"
         }
         1 => {
-            min == 260
-                && max == 1300
+            min == 338
+                && max == 1612
                 && governor == "simple_ondemand"
                 && gpu_boost_pipeline_matches(true)
                 && dvfs == 1
                 && power_policy == "always_on"
         }
         2 => {
-            min == 260
+            min == 338
                 && max == 598
                 && governor == "powersave"
                 && gpu_boost_pipeline_matches(false)
@@ -5433,24 +5436,24 @@ fn gpu_profile_configured(profile: i32) -> bool {
 
     match profile {
         3 => {
-            min == 1300
-                && max == 1300
-                && gpu_get_cur_freq_mhz() == 1300
+            min == 1612
+                && max == 1612
+                && gpu_get_cur_freq_mhz() == 1612
                 && governor == "performance"
                 && gpu_boost_pipeline_matches(true)
                 && dvfs == 0
                 && power_policy == "always_on"
         }
         1 => {
-            min == 260
-                && (max == 1300 || (thermal_limited && (260..1300).contains(&max)))
+            min == 338
+                && (max == 1612 || (thermal_limited && (338..1612).contains(&max)))
                 && governor == "simple_ondemand"
                 && gpu_boost_pipeline_matches(true)
                 && dvfs == 1
                 && power_policy == "always_on"
         }
         2 => {
-            min == 260
+            min == 338
                 && (max == 598 || (thermal_limited && max < 598))
                 && governor == "powersave"
                 && gpu_boost_pipeline_matches(false)
@@ -5467,19 +5470,19 @@ fn gpu_profile_configured(profile: i32) -> bool {
 }
 
 fn set_gpu_min_freq(mhz: i32) -> Result<(), String> {
-    if !(260..=1300).contains(&mhz) {
-        return Err("GPU minimum frequency must be 260-1300 MHz".into());
+    if !(338..=1612).contains(&mhz) {
+        return Err("GPU minimum frequency must be 338-1612 MHz".into());
     }
     let hz = (mhz as u64) * 1_000_000;
     let khz = (mhz as u64) * 1_000;
-    let opp_boost = ((1300 - mhz) / 26).clamp(0, 40);
+    let opp_boost = ((1612 - mhz) / 26).clamp(0, 51);
     let _ = service_control::write(
         "/sys/kernel/ged/hal/custom_boost_gpu_freq",
         opp_boost.to_string(),
     );
     gpu_write_file(
-        "/sys/class/devfreq/13000000.mali/min_freq",
-        "/sys/class/misc/mali0/device/devfreq/13000000.mali/min_freq",
+        "/sys/class/devfreq/48000000.mali/min_freq",
+        "/sys/class/misc/mali0/device/devfreq/48000000.mali/min_freq",
         &hz.to_string(),
     )?;
     let _ = service_control::write(
@@ -5498,7 +5501,7 @@ fn set_gpu_min_freq(mhz: i32) -> Result<(), String> {
     }
     mutate_persisted_state(|state| {
         state.gpu_min_freq_mhz = mhz;
-        if mhz < 1300 {
+        if mhz < 1612 {
             state.gpu_uncap = 0;
         }
     })?;
@@ -5506,19 +5509,19 @@ fn set_gpu_min_freq(mhz: i32) -> Result<(), String> {
 }
 
 fn set_gpu_max_freq(mhz: i32) -> Result<(), String> {
-    if !(260..=1300).contains(&mhz) {
-        return Err("GPU maximum frequency must be 260-1300 MHz".into());
+    if !(338..=1612).contains(&mhz) {
+        return Err("GPU maximum frequency must be 338-1612 MHz".into());
     }
     let hz = (mhz as u64) * 1_000_000;
     let khz = (mhz as u64) * 1_000;
-    let opp_upbound = ((1300 - mhz) / 26).clamp(0, 40);
+    let opp_upbound = ((1612 - mhz) / 26).clamp(0, 51);
     let _ = service_control::write(
         "/sys/kernel/ged/hal/custom_upbound_gpu_freq",
         opp_upbound.to_string(),
     );
     gpu_write_file(
-        "/sys/class/devfreq/13000000.mali/max_freq",
-        "/sys/class/misc/mali0/device/devfreq/13000000.mali/max_freq",
+        "/sys/class/devfreq/48000000.mali/max_freq",
+        "/sys/class/misc/mali0/device/devfreq/48000000.mali/max_freq",
         &hz.to_string(),
     )?;
     let _ = service_control::write(
@@ -5533,7 +5536,7 @@ fn set_gpu_max_freq(mhz: i32) -> Result<(), String> {
     }
     mutate_persisted_state(|state| {
         state.gpu_max_freq_mhz = mhz;
-        if mhz < 1300 {
+        if mhz < 1612 {
             state.gpu_uncap = 0;
         }
     })?;
@@ -5581,36 +5584,36 @@ fn set_gpu_uncap(enable: bool) -> Result<(), String> {
     } else {
         service_control::write("/sys/class/misc/mali0/device/power_policy", "coarse_demand")
             .map_err(|error| format!("GPU power policy write failed: {error}"))?;
-        let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "40");
+        let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "49");
         let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "0");
         let _ = service_control::write("/sys/kernel/ged/hal/gpu_boost_level", "0");
         gpu_write_file(
-            "/sys/class/devfreq/13000000.mali/min_freq",
-            "/sys/class/misc/mali0/device/devfreq/13000000.mali/min_freq",
-            "260000000",
+            "/sys/class/devfreq/48000000.mali/min_freq",
+            "/sys/class/misc/mali0/device/devfreq/48000000.mali/min_freq",
+            "338000000",
         )?;
         gpu_write_file(
-            "/sys/class/devfreq/13000000.mali/max_freq",
-            "/sys/class/misc/mali0/device/devfreq/13000000.mali/max_freq",
-            "1300000000",
+            "/sys/class/devfreq/48000000.mali/max_freq",
+            "/sys/class/misc/mali0/device/devfreq/48000000.mali/max_freq",
+            "1612000000",
         )?;
-        let _ = service_control::write("/sys/module/ged/parameters/gpu_bottom_freq", "260000");
-        let _ = service_control::write("/sys/module/ged/parameters/gpu_cust_boost_freq", "260000");
+        let _ = service_control::write("/sys/module/ged/parameters/gpu_bottom_freq", "338000");
+        let _ = service_control::write("/sys/module/ged/parameters/gpu_cust_boost_freq", "338000");
         let _ = service_control::write(
             "/sys/module/ged/parameters/gpu_cust_upbound_freq",
-            "1300000",
+            "1612000",
         );
         let _ = service_control::write("/sys/module/ged/parameters/gpu_dvfs_enable", "1");
         let _ = service_control::write("/sys/module/ged/parameters/ged_boost_enable", "0");
         let _ = service_control::write("/sys/module/ged/parameters/boost_gpu_enable", "0");
         let _ = service_control::write("/sys/module/ged/parameters/ged_smart_boost", "0");
         gpu_write_file(
-            "/sys/class/devfreq/13000000.mali/governor",
-            "/sys/class/misc/mali0/device/devfreq/13000000.mali/governor",
+            "/sys/class/devfreq/48000000.mali/governor",
+            "/sys/class/misc/mali0/device/devfreq/48000000.mali/governor",
             "simple_ondemand",
         )?;
-        if gpu_get_min_freq_mhz() != 260
-            || gpu_get_max_freq_mhz() != 1300
+        if gpu_get_min_freq_mhz() != 338
+            || gpu_get_max_freq_mhz() != 1612
             || gpu_get_governor() != "simple_ondemand"
             || gpu_get_power_policy() != "coarse_demand"
             || gpu_get_dvfs_enabled() != 1
@@ -5622,15 +5625,15 @@ fn set_gpu_uncap(enable: bool) -> Result<(), String> {
     mutate_persisted_state(|state| {
         state.gpu_uncap = if enable { 1 } else { 0 };
         if enable {
-            state.gpu_min_freq_mhz = 1300;
-            state.gpu_max_freq_mhz = 1300;
+            state.gpu_min_freq_mhz = 1612;
+            state.gpu_max_freq_mhz = 1612;
             state.gpu_ged_boost = 1;
             state.gpu_power_policy = "always_on".to_string();
             state.gpu = "performance".to_string();
             state.gpu_governor = "performance".to_string();
         } else {
-            state.gpu_min_freq_mhz = 260;
-            state.gpu_max_freq_mhz = 1300;
+            state.gpu_min_freq_mhz = 338;
+            state.gpu_max_freq_mhz = 1612;
             state.gpu_ged_boost = 0;
             state.gpu_power_policy = "coarse_demand".to_string();
             state.gpu = "simple_ondemand".to_string();
@@ -7080,32 +7083,32 @@ io.github.neeschal.dashessential 10228 0 /data/user/0/io.github.neeschal.dashess
 
     #[test]
     fn scales_resolution_density_from_the_rom_native_baseline() {
-        assert_eq!(scaled_display_density(520, 1220), 520);
-        assert_eq!(scaled_display_density(520, 1080), 460);
-        assert_eq!(scaled_display_density(520, 720), 307);
-        assert_eq!(scaled_display_density(520, 1440), 614);
-        assert_eq!(scaled_display_density(440, 1080), 390);
+        assert_eq!(scaled_display_density(504, 1280), 504);
+        assert_eq!(scaled_display_density(504, 1080), 425);
+        assert_eq!(scaled_display_density(504, 720), 284);
+        assert_eq!(scaled_display_density(504, 1440), 567);
+        assert_eq!(scaled_display_density(440, 1080), 371);
     }
 
     #[test]
     fn parses_dash_ged_current_opp() {
-        assert_eq!(parse_ged_current_frequency_mhz("40 260000\n"), Some(260));
-        assert_eq!(parse_ged_current_frequency_mhz("0 1300000\n"), Some(1300));
+        assert_eq!(parse_ged_current_frequency_mhz("51 338000\n"), Some(338));
+        assert_eq!(parse_ged_current_frequency_mhz("0 1612000\n"), Some(1612));
     }
 
     #[test]
     fn accepts_single_value_frequency_units() {
-        assert_eq!(parse_ged_current_frequency_mhz("260000000"), Some(260));
+        assert_eq!(parse_ged_current_frequency_mhz("338000000"), Some(338));
         assert_eq!(parse_ged_current_frequency_mhz("26"), Some(26));
         assert_eq!(parse_ged_current_frequency_mhz("unavailable"), None);
     }
 
     #[test]
     fn gaming_dynamic_policy_uses_the_full_opp_table() {
-        assert_eq!(gaming_dynamic_target_opp(100, 40, 40), 0);
-        assert_eq!(gaming_dynamic_target_opp(75, 30, 40), 22);
-        assert_eq!(gaming_dynamic_target_opp(60, 30, 40), 26);
-        assert_eq!(gaming_dynamic_target_opp(0, 0, 40), 40);
+        assert_eq!(gaming_dynamic_target_opp(100, 51, 51), 0);
+        assert_eq!(gaming_dynamic_target_opp(75, 30, 51), 22);
+        assert_eq!(gaming_dynamic_target_opp(60, 30, 51), 26);
+        assert_eq!(gaming_dynamic_target_opp(0, 0, 51), 51);
     }
 
     #[test]
