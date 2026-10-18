@@ -183,8 +183,8 @@ The bundled policy assigns dedicated types only to the generic sysfs paths that
 Dash Essential must write:
 
 ```text
-/sys/devices/platform/soc/13000000.mali/devfreq/13000000.mali
-/sys/devices/platform/13000000.mali/devfreq/13000000.mali
+/sys/devices/platform/soc/48000000.mali/devfreq/48000000.mali
+/sys/devices/platform/48000000.mali/devfreq/48000000.mali
 /sys/devices/platform/goodix_ts.0
 ```
 
@@ -240,7 +240,7 @@ the exact vendor image used by the ROM:
 ```bash
 adb shell ps -AZ | grep -E 'touchfeature|displayfeature'
 adb shell ls -lZ \
-  /sys/class/devfreq/13000000.mali/governor \
+  /sys/class/devfreq/48000000.mali/governor \
   /sys/class/misc/mali0/device/power_policy \
   /sys/kernel/ged/hal/gpu_boost_level \
   /sys/module/ged/parameters/ged_boost_enable \

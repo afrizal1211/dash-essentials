@@ -5169,7 +5169,7 @@ class SupportScreen extends StatelessWidget {
                     const SizedBox(width: 8),
                     Expanded(
                       child: Text(
-                        'Engineered exclusively for Dimensity 8400-Ultra (MT6899 / dash)',
+                        'Engineered exclusively for Dimensity 9500s (MT6991 / dash)',
                         style: TextStyle(
                           fontSize: 11,
                           fontWeight: FontWeight.w600,
@@ -8187,7 +8187,7 @@ class _CpuControlScreenState extends State<CpuControlScreen> {
                                     fit: BoxFit.scaleDown,
                                     alignment: Alignment.centerLeft,
                                     child: Text(
-                                      'Dimensity 8400-Ultra CPU',
+                                      'Dimensity 9500s CPU',
                                       style: TextStyle(
                                         fontSize: 14.5,
                                         fontWeight: FontWeight.w800,
@@ -9628,14 +9628,14 @@ class ResolutionScreen extends StatefulWidget {
 
 class _ResolutionScreenState extends State<ResolutionScreen> {
   int _customWidth = 1080;
-  int _customHeight = 2400;
-  int _customDensity = 460;
+  int _customHeight = 2340;
+  int _customDensity = 425;
   bool _lockAspectRatio = true;
   bool _applying = false;
   bool _customDefaultsLoaded = false;
 
   int _densityForWidth(int nativeDensity, int width) =>
-      ((nativeDensity * width + 610) ~/ 1220);
+      ((nativeDensity * width + 640) ~/ 1280);
 
   @override
   void initState() {
@@ -9649,7 +9649,7 @@ class _ResolutionScreenState extends State<ResolutionScreen> {
     setState(() => _applying = true);
 
     final bool isNative =
-        (width <= 0 || height <= 0) || (width == 1220 && height == 2712);
+        (width <= 0 || height <= 0) || (width == 1280 && height == 2772);
 
     if (isNative) {
       backend.resetDisplayResolution();
@@ -9700,17 +9700,17 @@ class _ResolutionScreenState extends State<ResolutionScreen> {
         final int detectedNativeDensity = backend.extendedValue(78);
         final int nativeDensity = detectedNativeDensity > 0
             ? detectedNativeDensity
-            : 520;
+            : 504;
         final int detectedActiveDensity = backend.extendedValue(38);
         final int activeDensity = detectedActiveDensity > 0
             ? detectedActiveDensity
             : nativeDensity;
 
         final bool isNative =
-            activeWidth <= 0 || (activeWidth == 1220 && activeHeight == 2712);
-        final bool isFhd = activeWidth == 1080 && activeHeight == 2400;
-        final bool isHd = activeWidth == 720 && activeHeight == 1600;
-        final bool isQhd = activeWidth == 1440 && activeHeight == 3200;
+            activeWidth <= 0 || (activeWidth == 1280 && activeHeight == 2772);
+        final bool isFhd = activeWidth == 1080 && activeHeight == 2340;
+        final bool isHd = activeWidth == 720 && activeHeight == 1560;
+        final bool isQhd = activeWidth == 1440 && activeHeight == 3120;
 
         if (!_customDefaultsLoaded && detectedNativeDensity > 0) {
           _customDefaultsLoaded = true;
@@ -9743,11 +9743,11 @@ class _ResolutionScreenState extends State<ResolutionScreen> {
           _ResolutionPreset(
             title: 'Native 1.5K Pro',
             badge: '1.5K NATIVE',
-            resolutionText: '1220 × 2712',
-            width: 1220,
-            height: 2712,
+            resolutionText: '1280 × 2772',
+            width: 1280,
+            height: 2772,
             density: nativeDensity,
-            aspectRatio: '20:9',
+            aspectRatio: '19.5:9',
             description:
                 'Dash physical hardware panel resolution. Maximum sharpness and true 1:1 pixel rendering with zero scaling.',
             accentColor: const Color(0xFF59BCFF),
@@ -9757,11 +9757,11 @@ class _ResolutionScreenState extends State<ResolutionScreen> {
           _ResolutionPreset(
             title: 'Full HD+ (High Performance)',
             badge: 'FHD+ 1080p',
-            resolutionText: '1080 × 2400',
+            resolutionText: '1080 × 2340',
             width: 1080,
-            height: 2400,
+            height: 2340,
             density: _densityForWidth(nativeDensity, 1080),
-            aspectRatio: '20:9',
+            aspectRatio: '19.5:9',
             description:
                 'Reduces GPU rasterization load by ~22%. Boosts sustained 120 FPS frame stability in heavy 3D games.',
             accentColor: const Color(0xFF38E598),
@@ -9771,11 +9771,11 @@ class _ResolutionScreenState extends State<ResolutionScreen> {
           _ResolutionPreset(
             title: 'HD+ (Ultra Battery Saver)',
             badge: 'HD+ 720p',
-            resolutionText: '720 × 1600',
+            resolutionText: '720 × 1560',
             width: 720,
-            height: 1600,
+            height: 1560,
             density: _densityForWidth(nativeDensity, 720),
-            aspectRatio: '20:9',
+            aspectRatio: '19.5:9',
             description:
                 'Lowest GPU workload and power consumption. Drastically extends battery life in emergency situations.',
             accentColor: const Color(0xFFFFA048),
@@ -9785,11 +9785,11 @@ class _ResolutionScreenState extends State<ResolutionScreen> {
           _ResolutionPreset(
             title: 'Quad HD+ (High Density Canvas)',
             badge: 'QHD+ 1440p',
-            resolutionText: '1440 × 3200',
+            resolutionText: '1440 × 3120',
             width: 1440,
-            height: 3200,
+            height: 3120,
             density: _densityForWidth(nativeDensity, 1440),
-            aspectRatio: '20:9',
+            aspectRatio: '19.5:9',
             description:
                 'Downscaled 2K virtual canvas for maximum screen real estate and ultra-compact multitasking view.',
             accentColor: const Color(0xFFB087FF),
@@ -9803,7 +9803,7 @@ class _ResolutionScreenState extends State<ResolutionScreen> {
             DetailHeader(title: 'Resolution', onBack: widget.onBack),
             const SizedBox(height: 4),
             Text(
-              'ROM-aware resolution and logical-density scaling for Dash (1220×2712 1.5K AMOLED)',
+              'ROM-aware resolution and logical-density scaling for Dash (1280×2772 1.5K AMOLED)',
               style: TextStyle(fontSize: 13.5, color: colors.onSurfaceVariant),
             ),
             const SizedBox(height: 12),
@@ -9843,7 +9843,7 @@ class _ResolutionScreenState extends State<ResolutionScreen> {
                               child: Text(
                                 activeWidth > 0 && activeHeight > 0
                                     ? '$activeWidth × $activeHeight'
-                                    : '1220 × 2712',
+                                    : '1280 × 2772',
                                 style: const TextStyle(
                                   fontSize: 21,
                                   fontWeight: FontWeight.w900,
@@ -9905,7 +9905,7 @@ class _ResolutionScreenState extends State<ResolutionScreen> {
                       _ResolutionMetricPill(
                         icon: Icons.aspect_ratio_rounded,
                         label: 'Aspect',
-                        value: '20:9',
+                        value: '19.5:9',
                       ),
                       const SizedBox(width: 8),
                       _ResolutionMetricPill(
@@ -9945,7 +9945,7 @@ class _ResolutionScreenState extends State<ResolutionScreen> {
                         ),
                         icon: const Icon(Icons.refresh_rounded, size: 17),
                         label: const Text(
-                          'Reset to 1.5K Native (1220 × 2712)',
+                          'Reset to 1.5K Native (1280 × 2772)',
                           style: TextStyle(
                             fontWeight: FontWeight.w800,
                             fontSize: 13,
@@ -9954,8 +9954,8 @@ class _ResolutionScreenState extends State<ResolutionScreen> {
                         onPressed: _applying
                             ? null
                             : () => _applyResolution(
-                                1220,
-                                2712,
+                                1280,
+                                2772,
                                 nativeDensity,
                                 '1.5K Native',
                               ),
@@ -9981,7 +9981,7 @@ class _ResolutionScreenState extends State<ResolutionScreen> {
                   ),
                 ),
                 Text(
-                  '1220×2712 Physical Panel',
+                  '1280×2772 Physical Panel',
                   style: TextStyle(
                     fontSize: 10.5,
                     fontWeight: FontWeight.w600,
@@ -10064,7 +10064,7 @@ class _ResolutionScreenState extends State<ResolutionScreen> {
                       const SizedBox(width: 8),
                       const Expanded(
                         child: Text(
-                          'Lock 20:9 Aspect Ratio (Prevents distortion)',
+                          'Lock 19.5:9 Aspect Ratio (Prevents distortion)',
                           style: TextStyle(
                             fontSize: 13,
                             fontWeight: FontWeight.w700,
@@ -10118,7 +10118,7 @@ class _ResolutionScreenState extends State<ResolutionScreen> {
                       setState(() {
                         _customWidth = w;
                         if (_lockAspectRatio) {
-                          _customHeight = (w * 2712 ~/ 1220);
+                          _customHeight = (w * 2772 ~/ 1280);
                           _customDensity = _densityForWidth(nativeDensity, w);
                         }
                       });
@@ -10264,7 +10264,7 @@ class _ResolutionScreenState extends State<ResolutionScreen> {
                   _DiagnosticRow(
                     label: 'Physical Panel Size',
                     good: true,
-                    detail: '1220 × 2712 (1.5K AMOLED)',
+                    detail: '1280 × 2772 (1.5K AMOLED)',
                   ),
                   const Divider(height: 14),
                   _DiagnosticRow(
@@ -10285,7 +10285,7 @@ class _ResolutionScreenState extends State<ResolutionScreen> {
                   _DiagnosticRow(
                     label: 'Panel Aspect Ratio',
                     good: true,
-                    detail: '20:9 (Native Precision)',
+                    detail: '19.5:9 (Native Precision)',
                   ),
                   const Divider(height: 14),
                   _DiagnosticRow(
@@ -12093,7 +12093,7 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
                 HeroCard(
                   icon: modeIcon,
                   accent: mainColor,
-                  title: 'Mali-G720 Graphics',
+                  title: 'Immortalis-G925 Graphics',
                   subtitle: modeSummary,
                 ),
                 const SizedBox(height: 12),
@@ -12259,7 +12259,7 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
                       ),
                     ),
                     Text(
-                      'Dimensity 8400-Ultra · Mali-G720 7-Core',
+                      'Dimensity 9500s · Immortalis-G925 MC12',
                       style: TextStyle(
                         fontSize: 11.5,
                         color: colors.onSurfaceVariant,
@@ -13138,12 +13138,12 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
           _buildDetailRow(
             colors,
             'GPU Architecture',
-            'Mali-G720 7-Core r0p1 (0x0C080700)',
+            'Immortalis-G925 MC12 (Valhall 5th Gen)',
           ),
           _buildDetailRow(
             colors,
             'Active Core Mask',
-            '0x150055 (All 7 execution clusters active)',
+            '12 execution cores active',
           ),
           _buildDetailRow(
             colors,
@@ -13167,7 +13167,7 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
           _buildDetailRow(
             colors,
             'Hardware Frequencies',
-            '41 Clock Steps (260 MHz → 1.30 GHz)',
+            '52 Clock Steps (338 MHz → 1.61 GHz)',
           ),
         ],
       ),
@@ -14259,8 +14259,8 @@ class _DashScrollPageState extends State<DashScrollPage> {
   double _lastScrollOffset = 0;
   bool _edgeLatched = false;
 
-  static const double _dashPhysicalWidth = 1220;
-  static const double _dashPhysicalHeight = 2712;
+  static const double _dashPhysicalWidth = 1280;
+  static const double _dashPhysicalHeight = 2772;
   static const double _dashPhysicalCutoutTop = 130;
 
   @override

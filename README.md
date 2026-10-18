@@ -1,7 +1,7 @@
 # Dash Essential
 
 Dash Essential is a native hardware-control application for Xiaomi Dash
-(POCO X7 Pro / Redmi Turbo 4) and its MediaTek Dimensity 8400-Ultra platform.
+(POCO X8 Pro Max) and its MediaTek Dimensity 9500s platform.
 It combines an Android `NativeActivity`, a Flutter AOT interface, a Rust host
 runtime, and a separately privileged Rust daemon. The UI and hardware-control
 logic remain native/AOT. A small, framework-only DEX adapter provides the
@@ -16,9 +16,11 @@ installed application UID.
 ## Supported target
 
 - Device codename: `dash`
-- SoC: MediaTek MT6899 / Dimensity 8400-Ultra
-- CPU: 8× Cortex-A725 (4+3+1 policies), up to 3.25 GHz
-- GPU: Mali-G720, 7 cores, up to 1300 MHz
+- SoC: MediaTek MT6991 / Dimensity 9500s
+- CPU: 8 cores (4× Cortex-A720 + 3× Cortex-X4 + 1× Cortex-X925), 4+3+1
+  policies, up to 3.73 GHz
+- GPU: Arm Immortalis-G925, 12 cores, up to 1612 MHz
+- Display: 1280 × 2772 AMOLED, 504 dpi logical density
 - ABI: ARM64
 - Android: API 31 or newer
 - Kernel userspace: 16 KB page-compatible native binaries
@@ -96,10 +98,10 @@ focused panels for each subsystem.
 
 | Profile | GPU range and governor | GED / power policy | CPU behavior |
 | --- | --- | --- | --- |
-| Stock Balanced | Vendor-managed 260–1300 MHz, `dummy` | GED off, `coarse_demand` | Unchanged; controlled separately |
-| Gaming Dynamic | 260–1300 MHz, `simple_ondemand` | GED on, `always_on` | Unchanged; controlled separately |
-| Battery Saver | 260–598 MHz, `powersave` | GED off, `coarse_demand` | Unchanged; controlled separately |
-| Extreme Beast | Fixed 1300 MHz, `performance`, DVFS off | GED on, `always_on` | Unchanged; controlled separately |
+| Stock Balanced | Vendor-managed 338–1612 MHz, `dummy` | GED off, `coarse_demand` | Unchanged; controlled separately |
+| Gaming Dynamic | 338–1612 MHz, `simple_ondemand` | GED on, `always_on` | Unchanged; controlled separately |
+| Battery Saver | 338–598 MHz, `powersave` | GED off, `coarse_demand` | Unchanged; controlled separately |
+| Extreme Beast | Fixed 1612 MHz, `performance`, DVFS off | GED on, `always_on` | Unchanged; controlled separately |
 
 GPU profiles never modify CPU governors, CPU clock ranges, or CPU core state.
 Vendor CPU and platform thermal services remain running in every mode. Gaming
