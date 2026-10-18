@@ -24,8 +24,24 @@ original wording.
   `dash_*` namespace, and application, module and binary strings renamed.
 - The KernelSU Next / Magisk root module is the only integration built and
   supported; upstream's AOSP ROM integration is not built here.
-- Module archives are signed with a local development key and carry a `-dev`
-  suffix; the upstream release signing key is not held by this derivative.
+- Releases are signed with this port's own key, which is never committed, and CI
+  verifies the signer against `android/package/release-cert.sha256` before
+  anything can be called a release. Builds without those secrets fall back to a
+  throwaway development key and a `-dev` suffix. The upstream release signing
+  key is not held by this derivative;
+  `android/package/UPSTREAM_RELEASE_CERT.sha256` records its fingerprint for
+  provenance only.
+- The Touch Bridge failure is diagnosed instead of silent. The daemon records
+  why the touch profile could not be applied, exposes it as `touch_error` and
+  `touch_error_code` in the snapshot, and the application and the module action
+  show the cause rather than a bare "Failed".
+- The in-memory touch timing patch is best-effort on `dash`. The shipped
+  `libtouchreport_hal.so` does not carry the upstream timing block, so a missing
+  block is reported and skipped instead of aborting the whole touch apply; the
+  vendor touch HAL path stays authoritative.
+- Application links point at `https://github.com/afrizal1211/dash-essentials`,
+  the `POCOX8ProMaxID` Telegram community, and the upstream Rodin Essential
+  source repository.
 - The upstream Flutter embedder engine release `v1.18.5` (Flutter 3.44.8) is
   pinned as the Dart/AOT runtime by `tools/fetch-flutter-engine-prebuilt.sh`.
 
