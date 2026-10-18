@@ -54,6 +54,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
+    # Only this job publishes a release, so only this job may write.
+    permissions:
+      contents: write
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -200,3 +204,61 @@ jobs:
             out/kernelsu-next/*/application/Dash-Essential.apk
           if-no-files-found: error
           retention-days: 14
+
+      # Workflow artifacts are internal to Actions and expire, so a tag that
+      # produced a release-signed archive also has to become a public release or
+      # there is nothing for a user to download. A development-signed build
+      # never publishes one.
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v') && env.DASH_ALLOW_UNOFFICIAL_SIGNING == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          zip=(out/kernelsu-next/*/Dash-Essential-KernelSU-Next-Magisk-*.zip)
+          sum=(out/kernelsu-next/*/Dash-Essential-KernelSU-Next-Magisk-*.zip.sha256)
+          apk=(out/kernelsu-next/*/application/Dash-Essential.apk)
+          [ "${#zip[@]}" -eq 1 ] || { echo "expected one module zip, found ${#zip[@]}" >&2; exit 1; }
+          [ "${#sum[@]}" -eq 1 ] || { echo "expected one checksum, found ${#sum[@]}" >&2; exit 1; }
+          [ "${#apk[@]}" -eq 1 ] || { echo "expected one application, found ${#apk[@]}" >&2; exit 1; }
+
+          cat > "$RUNNER_TEMP/notes.md" <<'NOTES'
+          ### KernelSU Next / Magisk module
+
+          Flash the ZIP from KernelSU Next, KernelSU or Magisk. The installer also
+          installs the bundled application; a copy signed with a different
+          certificate is removed once, and the settings under
+          `/data/adb/dash-essential` are kept.
+
+          `Dash-Essential.apk` is the same application the module installs, kept
+          for sideloading or inspection.
+
+          ### Verify the download
+
+          ```sh
+          sha256sum -c Dash-Essential-KernelSU-Next-Magisk-*.zip.sha256
+          ```
+
+          Signed with this port's release certificate, recorded in
+          `android/package/release-cert.sha256`. Port of Rodin Essential v1.18.5 by
+          NEESCHAL-3; see NOTICE and the repository README for credits.
+
+          ### Checksum
+
+          ```text
+          NOTES
+          cat "${sum[0]}" >> "$RUNNER_TEMP/notes.md"
+          printf '```\n' >> "$RUNNER_TEMP/notes.md"
+
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --clobber \
+              "${zip[@]}" "${sum[@]}" "${apk[@]}"
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag \
+              --title "Dash Essential $GITHUB_REF_NAME" \
+              --notes-file "$RUNNER_TEMP/notes.md" \
+              "${zip[@]}" "${sum[@]}" "${apk[@]}"
+          fi
+
