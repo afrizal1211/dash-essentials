@@ -199,8 +199,12 @@ uses (`devfreq-48000000.mali` in `/vendor/etc/thermald-devices.conf`) and only
 falls back to `cooling_device3`. The GED boost/ceiling nodes themselves take an
 index into the GPUEB DVFS ladder that the firmware publishes through
 `/proc/gpufreqv2/gpu_working_opp_table`, so the daemon maps frequencies to
-indices from that live table and falls back to the stock 26 MHz ladder when the
-node cannot be read.
+indices from that live table. The ladder is not a uniform 26 MHz step (24 of
+Dash's 52 indices all run at 1430 MHz), so a minimum-frequency floor resolves to
+the slowest OPP that still runs at or above the request and a maximum-frequency
+cap to the fastest OPP at or below it. If the node cannot be read the GED index
+is left untouched rather than guessed: the historic Rodin 26 MHz formula maps
+338 MHz to index 49, which is a 572 MHz floor on this ladder.
 
 Never grant the coredomain generic `sysfs:file` write access. If the target
 device tree already labels one of these exact paths, reconcile the duplicate

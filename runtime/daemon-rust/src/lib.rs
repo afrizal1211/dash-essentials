@@ -1932,10 +1932,10 @@ fn write_beast_gpu_constraints() {
 
 // Beast must never disable DVFS while the GPU is still running a previous
 // OPP. This is especially important during boot: the MediaTek power service
-// can publish its stock OPP 49 target after sys.boot_completed, and freezing
-// DVFS at that point leaves the GPU stuck below 1612 MHz until the UI submits
-// another profile command. Keep DVFS enabled while arming OPP 0, and disable
-// it only after the live GED frequency confirms 1612 MHz.
+// can publish its stock low-power OPP target after sys.boot_completed, and
+// freezing DVFS at that point leaves the GPU stuck below 1612 MHz until the UI
+// submits another profile command. Keep DVFS enabled while arming OPP 0, and
+// disable it only after the live GED frequency confirms 1612 MHz.
 fn arm_or_lock_beast_gpu() -> bool {
     write_beast_gpu_constraints();
 
@@ -1996,10 +1996,13 @@ pub fn enforce_performance_profile(profile: i32) -> bool {
                 "/sys/class/misc/mali0/device/devfreq/48000000.mali/governor",
                 "simple_ondemand",
             );
-            let _ = service_control::write(
+            write_ged_opp_index(
                 "/sys/kernel/ged/hal/custom_boost_gpu_freq",
-                ged_opp_index_for_mhz(GPU_MIN_FREQ_MHZ).to_string(),
+                GPU_MIN_FREQ_MHZ,
+                FreqBound::AtLeast,
             );
+            // Index 0 is the fastest OPP of every GPUEB ladder, so it needs no
+            // table lookup: it lifts this profile's ceiling out of the way.
             let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "0");
             let _ = service_control::write("/sys/module/ged/parameters/gpu_bottom_freq", "338000");
             let _ =
@@ -2016,7 +2019,8 @@ pub fn enforce_performance_profile(profile: i32) -> bool {
             let _ = service_control::write("/sys/module/ged/parameters/ged_smart_boost", "1");
         }
         2 => {
-            // Battery Saver: lowest governor with a 598 MHz hard ceiling.
+            // Battery Saver: lowest governor with a 598 MHz ceiling. The GED cap
+            // lands on the 572 MHz OPP, the fastest one no higher than 598 MHz.
             let _ = service_control::write("/sys/module/ged/parameters/gpu_dvfs_enable", "1");
             let _ = gpu_write_file(
                 "/sys/class/devfreq/48000000.mali/min_freq",
@@ -2033,13 +2037,15 @@ pub fn enforce_performance_profile(profile: i32) -> bool {
                 "/sys/class/misc/mali0/device/devfreq/48000000.mali/governor",
                 "powersave",
             );
-            let _ = service_control::write(
+            write_ged_opp_index(
                 "/sys/kernel/ged/hal/custom_boost_gpu_freq",
-                ged_opp_index_for_mhz(GPU_MIN_FREQ_MHZ).to_string(),
+                GPU_MIN_FREQ_MHZ,
+                FreqBound::AtLeast,
             );
-            let _ = service_control::write(
+            write_ged_opp_index(
                 "/sys/kernel/ged/hal/custom_upbound_gpu_freq",
-                ged_opp_index_for_mhz(GPU_BATTERY_CEILING_MHZ).to_string(),
+                GPU_BATTERY_CEILING_MHZ,
+                FreqBound::AtMost,
             );
             let _ = service_control::write("/sys/module/ged/parameters/gpu_bottom_freq", "338000");
             let _ =
@@ -2076,10 +2082,13 @@ pub fn enforce_performance_profile(profile: i32) -> bool {
                 "/sys/class/misc/mali0/device/devfreq/48000000.mali/governor",
                 "dummy",
             );
-            let _ = service_control::write(
+            write_ged_opp_index(
                 "/sys/kernel/ged/hal/custom_boost_gpu_freq",
-                ged_opp_index_for_mhz(GPU_MIN_FREQ_MHZ).to_string(),
+                GPU_MIN_FREQ_MHZ,
+                FreqBound::AtLeast,
             );
+            // Index 0 is the fastest OPP of every GPUEB ladder, so it needs no
+            // table lookup: it lifts this profile's ceiling out of the way.
             let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "0");
             let _ = service_control::write("/sys/module/ged/parameters/gpu_bottom_freq", "338000");
             let _ =
@@ -4664,7 +4673,7 @@ fn gaming_dynamic_guard() {
         clear_gpu_cooling_cap();
 
         if profile == 3 {
-            // MediaTek's power HAL can publish its stock OPP 49 target after
+            // MediaTek's power HAL can publish its stock low-power OPP after
             // boot completion. Reassert every Beast-owned node and lock DVFS
             // only after GED confirms that OPP 0 is actually live.
             let _ = arm_or_lock_beast_gpu();
@@ -4692,7 +4701,11 @@ fn gaming_dynamic_guard() {
         let target_opp = if now < boost_until {
             0
         } else {
-            gaming_dynamic_target_opp(smoothed_load, current_opp, lowest_opp)
+            // The ramp is expressed in OPP steps; on Dash's collapsed ladder
+            // those have to be turned into distinct frequencies before they can
+            // move the floor.
+            let ramp = gaming_dynamic_target_opp(smoothed_load, current_opp, lowest_opp);
+            opp_index_stepped_by_levels(live_gpu_opp_table(), current_opp, ramp - current_opp)
         };
 
         if target_opp != last_written_opp
@@ -5271,15 +5284,16 @@ fn gpu_get_loading() -> i32 {
 }
 
 /// Dash's Mali DVFS ladder is published by the GPUEB firmware and is only
-/// reachable through `/proc/gpufreqv2/`. GED's `custom_boost_gpu_freq` (floor)
-/// and `custom_upbound_gpu_freq` (ceiling) nodes take an index into that
-/// table where `0` is the fastest OPP, so resolve indices from the live table
-/// instead of assuming a fixed 26 MHz ladder.
-const GPU_TOP_FREQ_MHZ: i32 = 1612;
+/// reachable through `/proc/gpufreqv2/gpu_working_opp_table`. That proc file
+/// dumps `g_shared_status->working_table_gpu`, which is the very table GED
+/// resolves its indices against, and both writable GED nodes take one of its
+/// indices: `custom_boost_gpu_freq` is a minimum-frequency floor and
+/// `custom_upbound_gpu_freq` is a maximum-frequency cap, with `0` meaning the
+/// fastest OPP. Dash's ladder is not a uniform 26 MHz step -- 24 of its 52
+/// indices all run at 1430 MHz -- so an index is always resolved from the live
+/// table and never computed from a frequency.
 const GPU_MIN_FREQ_MHZ: i32 = 338;
 const GPU_BATTERY_CEILING_MHZ: i32 = 598;
-const GPU_FREQ_STEP_MHZ: i32 = 26;
-const GPU_OPP_COUNT_FALLBACK: i32 = 52;
 
 /// Parse a gpufreq v2 table dump. Non-privileged lines look like
 /// `[00] freq: 1612000, volt:  80625, vsram:  80625` and the privileged
@@ -5303,51 +5317,85 @@ fn parse_gpufreq_opp_table(contents: &str) -> Vec<(i32, i32)> {
 }
 
 fn live_gpu_opp_table() -> Option<&'static [(i32, i32)]> {
-    static TABLE: OnceLock<Option<Vec<(i32, i32)>>> = OnceLock::new();
-    TABLE
-        .get_or_init(|| {
-            for path in [
-                "/proc/gpufreqv2/gpu_working_opp_table",
-                "/proc/gpufreqv2/gpu_signed_opp_table",
-            ] {
-                let Ok(contents) = fs::read_to_string(path) else {
-                    continue;
-                };
-                let table = parse_gpufreq_opp_table(&contents);
-                if !table.is_empty() {
-                    return Some(table);
-                }
-            }
-            None
-        })
-        .as_deref()
+    // Only a successful parse is cached. `service.sh` can start the daemon while
+    // the gpufreq driver is still publishing the table, and caching that first
+    // failure would leave every later lookup without the firmware ladder.
+    static TABLE: OnceLock<Vec<(i32, i32)>> = OnceLock::new();
+
+    if let Some(table) = TABLE.get() {
+        return Some(table.as_slice());
+    }
+
+    for path in [
+        "/proc/gpufreqv2/gpu_working_opp_table",
+        "/proc/gpufreqv2/gpu_signed_opp_table",
+    ] {
+        let Ok(contents) = fs::read_to_string(path) else {
+            continue;
+        };
+        let table = parse_gpufreq_opp_table(&contents);
+        if !table.is_empty() {
+            return Some(TABLE.get_or_init(|| table).as_slice());
+        }
+    }
+
+    None
 }
 
-/// Exact frequency match wins; otherwise fall back to the nearest ladder step,
-/// preferring the slower OPP on a tie so a ceiling is never loosened.
-fn opp_index_for_freq_mhz(table: &[(i32, i32)], mhz: i32) -> Option<i32> {
+/// Which side of a requested frequency to stay on when the firmware ladder has
+/// no exact match. Both bounds round towards the safe side of the request, so a
+/// caller never ends up with a looser cap or a lower floor than it asked for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FreqBound {
+    /// The slowest OPP that still runs at or above the request, for
+    /// `custom_boost_gpu_freq`. Rounding down would let the GPU drop below the
+    /// minimum frequency the caller asked for.
+    AtLeast,
+    /// The fastest OPP that stays at or below the request, for
+    /// `custom_upbound_gpu_freq`. Rounding up would leave the cap looser than
+    /// the caller asked for.
+    AtMost,
+}
+
+fn opp_index_for_freq_mhz(table: &[(i32, i32)], mhz: i32, bound: FreqBound) -> Option<i32> {
     let target = mhz.saturating_mul(1000);
-    if let Some((index, _)) = table.iter().find(|(_, khz)| *khz == target) {
-        return Some(*index);
-    }
-    table
-        .iter()
-        .min_by_key(|(index, khz)| ((*khz - target).abs(), -*index))
-        .map(|(index, _)| *index)
+    let (matching, saturate) = match bound {
+        FreqBound::AtLeast => (
+            table
+                .iter()
+                .filter(|(_, khz)| *khz >= target)
+                .max_by_key(|(index, _)| *index),
+            table.iter().min_by_key(|(index, _)| *index),
+        ),
+        FreqBound::AtMost => (
+            table
+                .iter()
+                .filter(|(_, khz)| *khz <= target)
+                .min_by_key(|(index, _)| *index),
+            table.iter().max_by_key(|(index, _)| *index),
+        ),
+    };
+
+    // A request outside the ladder saturates at the end it ran off: a floor
+    // above the fastest OPP pins to that OPP, and a cap below the slowest OPP
+    // pins to the slowest one.
+    matching.or(saturate).map(|(index, _)| *index)
 }
 
-/// Historic 26 MHz ladder used when the GPUEB table cannot be read.
-fn ged_fallback_opp_index(mhz: i32) -> i32 {
-    ((GPU_TOP_FREQ_MHZ - mhz) / GPU_FREQ_STEP_MHZ).clamp(0, GPU_OPP_COUNT_FALLBACK - 1)
+/// Map a frequency to a GED OPP index, or `None` when the firmware ladder
+/// cannot be read. Leaving GED untouched is safer than guessing: the historic
+/// 26 MHz formula asks for index 49 on Dash, which is a 572 MHz minimum rather
+/// than the 338 MHz floor it was meant to allow.
+fn ged_opp_index_for_mhz(mhz: i32, bound: FreqBound) -> Option<i32> {
+    live_gpu_opp_table().and_then(|table| opp_index_for_freq_mhz(table, mhz, bound))
 }
 
-/// Map a frequency to the GED/gpufreq OPP index, reading the live firmware
-/// table when it is available and otherwise assuming the stock 26 MHz ladder.
-fn ged_opp_index_for_mhz(mhz: i32) -> i32 {
-    if let Some(index) = live_gpu_opp_table().and_then(|table| opp_index_for_freq_mhz(table, mhz)) {
-        return index;
+/// Point a GED index node at `mhz`, skipping the write when the firmware ladder
+/// is unavailable so a stale mapping can never pin the GPU.
+fn write_ged_opp_index(node: &str, mhz: i32, bound: FreqBound) {
+    if let Some(index) = ged_opp_index_for_mhz(mhz, bound) {
+        let _ = service_control::write(node, index.to_string());
     }
-    ged_fallback_opp_index(mhz)
 }
 
 fn gpu_get_cur_opp_index() -> i32 {
@@ -5399,6 +5447,49 @@ fn gaming_dynamic_target_opp(load: i32, current_opp: i32, lowest_opp: i32) -> i3
     } else {
         current_opp
     }
+}
+
+/// Walk the OPP ladder by `steps` *distinct frequencies* instead of `steps`
+/// table slots. Dash's firmware table collapses 24 adjacent indices onto
+/// 1430 MHz, so the load ramp's raw offsets would otherwise move the GED floor
+/// without changing the frequency it enforces. The offsets were tuned on the
+/// uniform 26 MHz ladder, where the two are the same thing.
+fn opp_index_stepped_by_levels(table: Option<&[(i32, i32)]>, from: i32, steps: i32) -> i32 {
+    if steps == 0 {
+        return from;
+    }
+
+    let Some(table) = table else {
+        return from
+            .saturating_add(steps)
+            .clamp(0, gpu_get_lowest_opp_index());
+    };
+
+    let mut levels: Vec<i32> = Vec::new();
+    for (_, khz) in table {
+        if levels.last() != Some(khz) {
+            levels.push(*khz);
+        }
+    }
+
+    let Some(current_khz) = table
+        .iter()
+        .find(|(index, _)| *index == from)
+        .map(|(_, khz)| *khz)
+    else {
+        return from;
+    };
+    let Some(level) = levels.iter().position(|khz| *khz == current_khz) else {
+        return from;
+    };
+
+    let target = (level as i32 + steps).clamp(0, levels.len() as i32 - 1);
+    let target_khz = levels[target as usize];
+    table
+        .iter()
+        .find(|(_, khz)| *khz == target_khz)
+        .map(|(index, _)| *index)
+        .unwrap_or(from)
 }
 
 fn parse_ged_current_frequency_mhz(raw: &str) -> Option<i32> {
@@ -5620,10 +5711,10 @@ fn set_gpu_min_freq(mhz: i32) -> Result<(), String> {
     }
     let hz = (mhz as u64) * 1_000_000;
     let khz = (mhz as u64) * 1_000;
-    let opp_boost = ged_opp_index_for_mhz(mhz);
-    let _ = service_control::write(
+    write_ged_opp_index(
         "/sys/kernel/ged/hal/custom_boost_gpu_freq",
-        opp_boost.to_string(),
+        mhz,
+        FreqBound::AtLeast,
     );
     gpu_write_file(
         "/sys/class/devfreq/48000000.mali/min_freq",
@@ -5659,10 +5750,10 @@ fn set_gpu_max_freq(mhz: i32) -> Result<(), String> {
     }
     let hz = (mhz as u64) * 1_000_000;
     let khz = (mhz as u64) * 1_000;
-    let opp_upbound = ged_opp_index_for_mhz(mhz);
-    let _ = service_control::write(
+    write_ged_opp_index(
         "/sys/kernel/ged/hal/custom_upbound_gpu_freq",
-        opp_upbound.to_string(),
+        mhz,
+        FreqBound::AtMost,
     );
     gpu_write_file(
         "/sys/class/devfreq/48000000.mali/max_freq",
@@ -5729,9 +5820,10 @@ fn set_gpu_uncap(enable: bool) -> Result<(), String> {
     } else {
         service_control::write("/sys/class/misc/mali0/device/power_policy", "coarse_demand")
             .map_err(|error| format!("GPU power policy write failed: {error}"))?;
-        let _ = service_control::write(
+        write_ged_opp_index(
             "/sys/kernel/ged/hal/custom_boost_gpu_freq",
-            ged_opp_index_for_mhz(GPU_MIN_FREQ_MHZ).to_string(),
+            GPU_MIN_FREQ_MHZ,
+            FreqBound::AtLeast,
         );
         let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "0");
         let _ = service_control::write("/sys/kernel/ged/hal/gpu_boost_level", "0");
@@ -7039,18 +7131,17 @@ mod tests {
     #[cfg(not(target_os = "android"))]
     use super::run_process_with_timeout;
     use super::{
-        AppUidPolicy, GPU_BATTERY_CEILING_MHZ, GPU_MIN_FREQ_MHZ, GPU_TOP_FREQ_MHZ,
+        AppUidPolicy, FreqBound, GPU_BATTERY_CEILING_MHZ, GPU_MIN_FREQ_MHZ,
         MI_THERMAL_NO_LIMITS_MODE, PersistedState, charging_profile_fcc_ua,
         classify_touch_panel_version, client_uid_allowed, cpu_frequency_drift_status,
-        find_touch_thp_config_offset, gaming_dynamic_target_opp, ged_fallback_opp_index,
-        mi_thermal_cpu_limit_request, migrate_legacy_gpu_profile_cpu_state,
-        mtk_powerhal_cpu_range_request, normalize_charging_profile,
-        normalize_mi_thermal_config_mode, normalize_reported_power_w, opp_index_for_freq_mhz,
-        package_app_id_from_packages_list, parse_cpu_frequency_table, parse_cpu_time_in_state,
-        parse_ged_current_frequency_mhz, parse_gpufreq_opp_table, persisted_cpu_ranges_active,
-        profile_uses_ged_boost, scaled_display_density, tcp_client_uid_from_table,
-        touch_hal_profile_sequence, valid_charging_profile, valid_mi_thermal_config_mode,
-        validate_cpu_frequency_range_against,
+        find_touch_thp_config_offset, gaming_dynamic_target_opp, mi_thermal_cpu_limit_request,
+        migrate_legacy_gpu_profile_cpu_state, mtk_powerhal_cpu_range_request,
+        normalize_charging_profile, normalize_mi_thermal_config_mode, normalize_reported_power_w,
+        opp_index_for_freq_mhz, opp_index_stepped_by_levels, package_app_id_from_packages_list,
+        parse_cpu_frequency_table, parse_cpu_time_in_state, parse_ged_current_frequency_mhz,
+        parse_gpufreq_opp_table, persisted_cpu_ranges_active, profile_uses_ged_boost,
+        scaled_display_density, tcp_client_uid_from_table, touch_hal_profile_sequence,
+        valid_charging_profile, valid_mi_thermal_config_mode, validate_cpu_frequency_range_against,
     };
 
     fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
@@ -7210,44 +7301,150 @@ posdiv: 0, margin:     0, power:     0\n";
         assert!(parse_gpufreq_opp_table("gpufreq_status: no table here").is_empty());
     }
 
-    #[test]
-    fn resolves_ged_opp_indices_from_the_live_ladder() {
-        // Stock 26 MHz ladder, including the trailing 338 MHz repeat.
-        let fine: Vec<(i32, i32)> = (0..52)
-            .map(|i| (i, (1_612_000 - i * 26_000).max(338_000)))
-            .collect();
-        assert_eq!(opp_index_for_freq_mhz(&fine, 1612), Some(0));
-        assert_eq!(opp_index_for_freq_mhz(&fine, 598), Some(39));
-        assert_eq!(opp_index_for_freq_mhz(&fine, 338), Some(49));
-        // The stock ladder is reproduced exactly, so live reads never change it.
-        for mhz in [GPU_TOP_FREQ_MHZ, GPU_BATTERY_CEILING_MHZ, GPU_MIN_FREQ_MHZ] {
-            assert_eq!(
-                opp_index_for_freq_mhz(&fine, mhz),
-                Some(ged_fallback_opp_index(mhz))
-            );
-        }
-
-        // Coarser GPUEB binning: exact hits move, and 598 MHz ties between
-        // 624 and 572 MHz must pick the slower OPP.
-        let coarse: Vec<(i32, i32)> = vec![
-            (0, 1_612_000),
-            (4, 1_508_000),
-            (7, 1_430_000),
-            (49, 624_000),
-            (50, 572_000),
-            (51, 338_000),
+    /// The 52-entry ladder Dash's GPUEB publishes, copied from
+    /// `/proc/gpufreqv2/gpu_working_opp_table` on the device. GED resolves its
+    /// `custom_boost_gpu_freq`/`custom_upbound_gpu_freq` indices against exactly
+    /// this array (`ged_get_freq_by_idx()` reads `working_table_gpu`), so the
+    /// 24 duplicate 1430 MHz entries are real and not a parsing artifact.
+    fn dash_working_opp_table() -> Vec<(i32, i32)> {
+        let groups: [(i32, i32, i32); 24] = [
+            (0, 3, 1_612_000),
+            (4, 6, 1_508_000),
+            (7, 30, 1_430_000),
+            (31, 31, 1_378_000),
+            (32, 32, 1_326_000),
+            (33, 33, 1_300_000),
+            (34, 34, 1_248_000),
+            (35, 35, 1_196_000),
+            (36, 36, 1_144_000),
+            (37, 37, 1_118_000),
+            (38, 38, 1_066_000),
+            (39, 39, 1_014_000),
+            (40, 40, 962_000),
+            (41, 41, 936_000),
+            (42, 42, 884_000),
+            (43, 43, 832_000),
+            (44, 44, 806_000),
+            (45, 45, 754_000),
+            (46, 46, 702_000),
+            (47, 47, 650_000),
+            (48, 48, 624_000),
+            (49, 49, 572_000),
+            (50, 50, 442_000),
+            (51, 51, 338_000),
         ];
-        assert_eq!(opp_index_for_freq_mhz(&coarse, 1612), Some(0));
-        assert_eq!(opp_index_for_freq_mhz(&coarse, 338), Some(51));
-        assert_eq!(opp_index_for_freq_mhz(&coarse, 598), Some(50));
+
+        let mut table = Vec::new();
+        for (from, to, khz) in groups {
+            for index in from..=to {
+                table.push((index, khz));
+            }
+        }
+        table
     }
 
     #[test]
-    fn ged_fallback_index_matches_the_historic_formula() {
-        assert_eq!(ged_fallback_opp_index(1612), 0);
-        assert_eq!(ged_fallback_opp_index(598), 39);
-        assert_eq!(ged_fallback_opp_index(338), 49);
-        assert_eq!(ged_fallback_opp_index(0), 51);
+    fn resolves_ged_opp_indices_from_the_live_ladder() {
+        let dash = dash_working_opp_table();
+        assert_eq!(dash.len(), 52);
+        assert_eq!(dash[0], (0, 1_612_000));
+        assert_eq!(dash[51], (51, 338_000));
+
+        // A minimum-frequency floor resolves to the slowest OPP that still runs
+        // at or above the request, so the 338 MHz profile minimum is index 51.
+        // The historic 26 MHz formula asks for index 49, a 572 MHz floor here.
+        assert_eq!(
+            opp_index_for_freq_mhz(&dash, GPU_MIN_FREQ_MHZ, FreqBound::AtLeast),
+            Some(51)
+        );
+        assert_eq!(
+            opp_index_for_freq_mhz(&dash, 1_612, FreqBound::AtLeast),
+            Some(3)
+        );
+        assert_eq!(
+            opp_index_for_freq_mhz(&dash, 1_700, FreqBound::AtLeast),
+            Some(0)
+        );
+        // 1000 MHz sits between 962 and 1014 MHz, so the floor rounds up.
+        assert_eq!(
+            opp_index_for_freq_mhz(&dash, 1_000, FreqBound::AtLeast),
+            Some(39)
+        );
+
+        // A maximum-frequency cap resolves to the fastest OPP at or below the
+        // request, so the 598 MHz battery ceiling becomes 572 MHz, not 624 MHz.
+        assert_eq!(
+            opp_index_for_freq_mhz(&dash, GPU_BATTERY_CEILING_MHZ, FreqBound::AtMost),
+            Some(49)
+        );
+        assert_eq!(
+            opp_index_for_freq_mhz(&dash, 1_000, FreqBound::AtMost),
+            Some(40)
+        );
+        assert_eq!(
+            opp_index_for_freq_mhz(&dash, 1_612, FreqBound::AtMost),
+            Some(0)
+        );
+        assert_eq!(
+            opp_index_for_freq_mhz(&dash, 100, FreqBound::AtMost),
+            Some(51)
+        );
+
+        // The uniform 26 MHz ladder the ramp and profile numbers were tuned on
+        // keeps resolving to the exact indices Rodin used.
+        let fine: Vec<(i32, i32)> = (0..52)
+            .map(|i| (i, (1_612_000 - i * 26_000).max(338_000)))
+            .collect();
+        assert_eq!(
+            opp_index_for_freq_mhz(&fine, 1_612, FreqBound::AtLeast),
+            Some(0)
+        );
+        assert_eq!(
+            opp_index_for_freq_mhz(&fine, 598, FreqBound::AtLeast),
+            Some(39)
+        );
+        assert_eq!(
+            opp_index_for_freq_mhz(&fine, 598, FreqBound::AtMost),
+            Some(39)
+        );
+        assert_eq!(
+            opp_index_for_freq_mhz(&fine, 338, FreqBound::AtMost),
+            Some(49)
+        );
+        assert_eq!(
+            opp_index_for_freq_mhz(&fine, 338, FreqBound::AtLeast),
+            Some(51)
+        );
+    }
+
+    #[test]
+    fn empty_ladder_yields_no_ged_index() {
+        // Nothing to resolve against must report "unknown" so the daemon leaves
+        // GED's indices untouched instead of pinning a guessed floor.
+        assert_eq!(opp_index_for_freq_mhz(&[], 338, FreqBound::AtLeast), None);
+        assert_eq!(opp_index_for_freq_mhz(&[], 598, FreqBound::AtMost), None);
+    }
+
+    #[test]
+    fn steps_the_gaming_ramp_by_frequency_level_not_by_index() {
+        let dash = dash_working_opp_table();
+        let table = Some(dash.as_slice());
+
+        // Levels run 1612, 1508, 1430, 1378, ... so eight levels slower than the
+        // fastest OPP is 1144 MHz, not index 8 (which is still 1430 MHz).
+        assert_eq!(opp_index_stepped_by_levels(table, 0, 8), 36);
+        assert_eq!(dash[36], (36, 1_144_000));
+        // Two levels slower than the 1430 MHz plateau steps past all 24 of its
+        // duplicate entries instead of staying on 1430 MHz.
+        assert_eq!(opp_index_stepped_by_levels(table, 20, 2), 32);
+        assert_eq!(dash[32], (32, 1_326_000));
+        assert_eq!(opp_index_stepped_by_levels(table, 20, -2), 0);
+        // A hold is a no-op and both ends saturate.
+        assert_eq!(opp_index_stepped_by_levels(table, 20, 0), 20);
+        assert_eq!(opp_index_stepped_by_levels(table, 51, 5), 51);
+        assert_eq!(opp_index_stepped_by_levels(table, 0, -5), 0);
+        // Without the firmware ladder the ramp degrades to raw index steps.
+        assert_eq!(opp_index_stepped_by_levels(None, 20, 4), 24);
     }
 
     #[test]
