@@ -10,7 +10,16 @@ DASH_STAGE="$DASH_BUILD_ROOT/module"
 DASH_APP_BUILD="$DASH_BUILD_ROOT/application"
 
 DASH_VERSION="$(sed -n 's/^version=//p' "$DASH_MODULE_SOURCE/module.prop")"
-DASH_ZIP_NAME="Dash-Essential-KernelSU-Next-Magisk-${DASH_VERSION}.zip"
+
+# Development builds use a throwaway signing key. They still have to pass every
+# packaging check, but they must never look like, or overwrite, a release.
+DASH_ALLOW_UNOFFICIAL_SIGNING="${DASH_ALLOW_UNOFFICIAL_SIGNING:-0}"
+DASH_ZIP_SUFFIX=""
+if [ "$DASH_ALLOW_UNOFFICIAL_SIGNING" = "1" ]; then
+    DASH_ZIP_SUFFIX="-dev"
+fi
+
+DASH_ZIP_NAME="Dash-Essential-KernelSU-Next-Magisk-${DASH_VERSION}${DASH_ZIP_SUFFIX}.zip"
 DASH_ZIP="$DASH_BUILD_ROOT/$DASH_ZIP_NAME"
 DASH_STABLE_ZIP="$DASH_PROJECT_ROOT/out/Dash-Essential-KernelSU-Next-Magisk.zip"
 
@@ -154,12 +163,20 @@ DASH_EXPECTED_CERT_DIGEST="$(tr -d '[:space:]:' \
     echo "Unable to read APK signing certificate" >&2
     exit 1
 }
-[ "$DASH_CERT_DIGEST" = "$DASH_EXPECTED_CERT_DIGEST" ] || {
-    echo "Official release certificate mismatch" >&2
-    echo "expected=$DASH_EXPECTED_CERT_DIGEST" >&2
-    echo "actual=$DASH_CERT_DIGEST" >&2
-    exit 1
-}
+if [ "$DASH_ALLOW_UNOFFICIAL_SIGNING" = "1" ]; then
+    echo "WARNING: DASH_ALLOW_UNOFFICIAL_SIGNING=1 (development build)" >&2
+    echo "WARNING: signed with an unofficial key; not distributable" >&2
+    echo "WARNING: official=$DASH_EXPECTED_CERT_DIGEST" >&2
+    echo "WARNING: actual=$DASH_CERT_DIGEST" >&2
+else
+    [ "$DASH_CERT_DIGEST" = "$DASH_EXPECTED_CERT_DIGEST" ] || {
+        echo "Official release certificate mismatch" >&2
+        echo "expected=$DASH_EXPECTED_CERT_DIGEST" >&2
+        echo "actual=$DASH_CERT_DIGEST" >&2
+        echo "Set DASH_ALLOW_UNOFFICIAL_SIGNING=1 only for local development builds." >&2
+        exit 1
+    }
+fi
 "$DASH_ZIPALIGN" -c -P 16 -v 4 "$DASH_STAGE/app/DashEssential.apk" >/dev/null
 ANDROID_SDK_ROOT="$DASH_SDK_ROOT" bash "$DASH_PROJECT_ROOT/tools/check-platform-dex.sh" "$DASH_STAGE/app/DashEssential.apk"
 
@@ -219,7 +236,11 @@ DASH_ZIP_APK_SHA="$(unzip -p "$DASH_ZIP" app/DashEssential.apk | sha256sum | awk
     exit 1
 }
 
-cp -f "$DASH_ZIP" "$DASH_STABLE_ZIP"
+if [ "$DASH_ALLOW_UNOFFICIAL_SIGNING" = "1" ]; then
+    echo "Development build: leaving $DASH_STABLE_ZIP untouched" >&2
+else
+    cp -f "$DASH_ZIP" "$DASH_STABLE_ZIP"
+fi
 DASH_ZIP_SHA256="$(sha256sum "$DASH_ZIP" | awk '{print $1}')"
 printf '%s  %s\n' "$DASH_ZIP_SHA256" "${DASH_ZIP##*/}" \
     | tee "$DASH_ZIP.sha256"
@@ -229,5 +250,14 @@ echo "MANAGERS=KernelSU Next, Magisk"
 echo "APK_PACKAGE=$DASH_APK_PACKAGE"
 echo "APK_VERSION=$DASH_APK_VERSION_NAME ($DASH_APK_VERSION_CODE)"
 echo "APK_CERT_SHA256=$DASH_CERT_DIGEST"
+if [ "$DASH_ALLOW_UNOFFICIAL_SIGNING" = "1" ]; then
+    echo "SIGNING=development (unofficial key)"
+else
+    echo "SIGNING=official"
+fi
 echo "ZIP=$DASH_ZIP"
-echo "STABLE_ZIP=$DASH_STABLE_ZIP"
+if [ "$DASH_ALLOW_UNOFFICIAL_SIGNING" = "1" ]; then
+    echo "STABLE_ZIP=skipped (development build)"
+else
+    echo "STABLE_ZIP=$DASH_STABLE_ZIP"
+fi

@@ -2,37 +2,68 @@
 
 ## Host requirements
 
-- Linux x86_64
-- Flutter SDK on `PATH`
-- A matching Flutter engine checkout
+- Linux x86_64 (or macOS/Windows x86_64 for the Flutter and Android toolchains)
+- Flutter SDK on `PATH`, pinned to the engine revision
+- A release-mode Flutter engine prebuilt
 - Rust and the `aarch64-linux-android` target
 - Android SDK with platform 36, current build-tools, and an NDK
 - JDK 17 or newer
-- `ninja`, `readelf`, `file`, `zip`, and `unzip`
+- `readelf`, `file`, `zip`, and `unzip`
 
 Set `ANDROID_SDK_ROOT` when the SDK is not at `$HOME/Android/Sdk`.
 
-## Prepare Rust and Flutter
+A phone cannot build the project. The Android NDK ships a `linux-x86_64` host
+toolchain only, and `flutter assemble` AOT-compiles `libapp.so` with a host
+`gen_snapshot` that Flutter publishes for x86_64 hosts only.
+
+## Pinned Flutter runtime
+
+The custom embedder links `libflutter_engine.so` and loads `icudtl.dat`, so the
+engine, the engine header, and the `gen_snapshot` that writes `libapp.so` must
+all belong to one Flutter release. This tree is pinned to:
+
+| Component | Value |
+| --- | --- |
+| Flutter | 3.44.8 stable |
+| Framework revision | `058e0af2c2b57e369d905a03ac9748b0ebf543c6` |
+| Engine revision | `0cd610717bde95fd88343c64f81c11ba4e5c0010` |
+| Dart | 3.12.2 (`e9ed4fc9f1544c58d8a9347c1fc9471d8dd7c465`) |
+
+Flutter publishes release-mode embedder libraries from an engine checkout, not
+from the SDK artifact service (the SDK serves the debug embedder only), so the
+default path reuses the exact release engine the v1.18.5 module shipped and
+verifies it by digest:
 
 ```bash
-rustup target add aarch64-linux-android
-flutter pub get --directory ui/flutter
+./tools/fetch-flutter-engine-prebuilt.sh
 ```
 
-The custom embedder must use a Flutter engine built from the framework's pinned
-engine revision. If the engine checkout is not under the Flutter SDK, point the
-engine build script at it:
+The script installs ignored local artifacts and fails unless the engine still
+carries the pinned framework and Dart revisions and
+`runtime/flutter-engine/include/embedder.h` still matches the engine ABI:
+
+```text
+runtime/flutter-engine/prebuilt/android-arm64/libflutter_engine.so
+runtime/flutter-engine/prebuilt/android-arm64/icudtl.dat
+```
+
+Building the engine from source remains supported when the pin has to move.
+It needs a full engine checkout (~25 GB) and `ninja`:
 
 ```bash
 DASH_FLUTTER_ENGINE_SRC=/absolute/path/to/engine/src \
   ./tools/build-flutter-engine.sh
 ```
 
-The script installs ignored local artifacts at:
+Whichever path fills the prebuilt directory, build the UI with the matching
+Flutter SDK.
 
-```text
-runtime/flutter-engine/prebuilt/android-arm64/libflutter_engine.so
-runtime/flutter-engine/prebuilt/android-arm64/icudtl.dat
+## Prepare Rust and Flutter
+
+```bash
+rustup target add aarch64-linux-android
+./tools/fetch-flutter-engine-prebuilt.sh
+flutter pub get --directory ui/flutter
 ```
 
 ## Build the application and daemon
@@ -88,6 +119,7 @@ dart format --output=none --set-exit-if-changed ui/flutter/lib
 (cd ui/flutter && flutter analyze)
 bash -n build-and-install.sh
 bash -n tools/build-flutter-engine.sh
+bash -n tools/fetch-flutter-engine-prebuilt.sh
 bash -n tools/build-kernelsu-next-module.sh
 bash -n tools/export-aosp-bundle.sh
 bash -n tools/integrate-aosp-rom.sh
@@ -185,6 +217,39 @@ user-installed copy, it removes that package and installs the bundled APK while
 leaving `/data/adb/dash-essential` untouched. This resets application-local
 preferences once. A cross-signed ROM-native system package is still rejected;
 only its ROM maintainer can replace it safely.
+
+### Development builds
+
+The published release keystore is not in this repository, so a test build has
+to opt out of the release-certificate gate explicitly:
+
+```bash
+DASH_KEYSTORE=/absolute/path/dev.jks \
+DASH_KEY_ALIAS=dash-essential-development \
+DASH_KEYSTORE_PASS=android \
+DASH_KEY_PASS=android \
+DASH_ALLOW_UNOFFICIAL_SIGNING=1 \
+  ./tools/build-kernelsu-next-module.sh
+```
+
+Development builds still pass every packaging check, but they are named
+`...-dev.zip`, they print `SIGNING=development`, and they never overwrite
+`out/Dash-Essential-KernelSU-Next-Magisk.zip`. They cannot update a device that
+carries a release-signed copy without first removing that application.
+
+## CI build
+
+`.github/workflows/build-dash-essential-module.yml` runs the same sequence on an
+Ubuntu x86_64 runner: Flutter 3.44.8, Android platform 36 with build-tools and
+an NDK, `aarch64-linux-android` Rust, the pinned engine prebuilt, then
+`tools/build-kernelsu-next-module.sh` with a development key. It uploads the
+module ZIP, its checksum, and the APK as workflow artifacts, and can be started
+from a tag push or by hand.
+
+To keep one stable development signature across runs, create a JKS with alias
+`dash-essential-development` and store and key password `android`, base64-encode
+it, and save it as the `DASH_DEV_KEYSTORE_BASE64` repository secret. Without the
+secret each run generates a fresh key, so installs replace each other.
 
 Version 1.18.4 introduces the replacement signing identity. Its public fingerprint
 is recorded in `android/package/release-cert.sha256`. Keep the corresponding

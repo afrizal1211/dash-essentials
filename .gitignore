@@ -44,3 +44,4 @@ perf-captures/
 *.keystore
 # Locally built pinned Flutter runtime binaries
 runtime/flutter-engine/prebuilt/
+runtime/flutter-engine/.cache/
