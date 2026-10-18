@@ -726,7 +726,7 @@ final class DashBackend {
       return resetDisplayResolution();
     }
     final int detectedDensity = extendedValue(78);
-    final int nativeDensity = detectedDensity > 0 ? detectedDensity : 504;
+    final int nativeDensity = detectedDensity > 0 ? detectedDensity : 520;
     final int safeDensity = density > 0
         ? density
         : ((nativeDensity * width + 640) ~/ 1280);

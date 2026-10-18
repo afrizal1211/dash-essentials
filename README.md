@@ -20,7 +20,7 @@ installed application UID.
 - CPU: 8 cores (4× Cortex-A720 + 3× Cortex-X4 + 1× Cortex-X925), 4+3+1
   policies, up to 3.73 GHz
 - GPU: Arm Immortalis-G925, 12 cores, up to 1612 MHz
-- Display: 1280 × 2772 AMOLED, 504 dpi logical density
+- Display: 1280 × 2772 AMOLED, 520 dpi logical density
 - ABI: ARM64
 - Android: API 31 or newer
 - Kernel userspace: 16 KB page-compatible native binaries

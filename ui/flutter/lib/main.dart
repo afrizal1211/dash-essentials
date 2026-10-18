@@ -7042,6 +7042,7 @@ class _TouchBoostScreenState extends State<TouchBoostScreen> {
         final String panel = switch (panelCode) {
           1 => 'Goodix GT9916',
           2 => 'FocalTech',
+          3 => 'Novatek NT38771',
           _ => 'Panel auto-detect',
         };
         final String engine = switch (controlPath) {
@@ -9629,7 +9630,7 @@ class ResolutionScreen extends StatefulWidget {
 class _ResolutionScreenState extends State<ResolutionScreen> {
   int _customWidth = 1080;
   int _customHeight = 2340;
-  int _customDensity = 425;
+  int _customDensity = 439;
   bool _lockAspectRatio = true;
   bool _applying = false;
   bool _customDefaultsLoaded = false;
@@ -9700,7 +9701,7 @@ class _ResolutionScreenState extends State<ResolutionScreen> {
         final int detectedNativeDensity = backend.extendedValue(78);
         final int nativeDensity = detectedNativeDensity > 0
             ? detectedNativeDensity
-            : 504;
+            : 520;
         final int detectedActiveDensity = backend.extendedValue(38);
         final int activeDensity = detectedActiveDensity > 0
             ? detectedActiveDensity
@@ -13148,7 +13149,7 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
           _buildDetailRow(
             colors,
             'Thermal Cooling Node',
-            '/sys/class/thermal/cooling_device3',
+            'devfreq-48000000.mali (auto-resolved)',
           ),
           _buildDetailRow(
             colors,

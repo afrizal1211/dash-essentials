@@ -1867,8 +1867,32 @@ fn write_if_present(path: &str, value: &str) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Dash registers the Mali devfreq cooler at an index that depends on probe
+/// order; Xiaomi's thermal map only ever names it (`devfreq-48000000.mali` in
+/// /vendor/etc/thermald-devices.conf). Resolve the live `cooling_deviceN`
+/// directory once instead of trusting the historical index 3.
+const GPU_COOLING_DEVICE_FALLBACK: &str = "/sys/class/thermal/cooling_device3";
+
+fn gpu_cooling_device_dir() -> &'static str {
+    static DIR: OnceLock<String> = OnceLock::new();
+    DIR.get_or_init(|| {
+        for index in 0..32 {
+            let dir = format!("/sys/class/thermal/cooling_device{index}");
+            let Ok(kind) = fs::read_to_string(format!("{dir}/type")) else {
+                continue;
+            };
+            let kind = kind.trim().to_ascii_lowercase();
+            if kind.contains("mali") || kind.contains("gpu") {
+                return dir;
+            }
+        }
+        GPU_COOLING_DEVICE_FALLBACK.to_string()
+    })
+    .as_str()
+}
+
 fn clear_gpu_cooling_cap() {
-    let _ = service_control::write("/sys/class/thermal/cooling_device3/cur_state", "0");
+    let _ = service_control::write(format!("{}/cur_state", gpu_cooling_device_dir()), "0");
 }
 
 fn profile_uses_ged_boost(profile: i32) -> bool {
@@ -1972,7 +1996,10 @@ pub fn enforce_performance_profile(profile: i32) -> bool {
                 "/sys/class/misc/mali0/device/devfreq/48000000.mali/governor",
                 "simple_ondemand",
             );
-            let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "49");
+            let _ = service_control::write(
+                "/sys/kernel/ged/hal/custom_boost_gpu_freq",
+                ged_opp_index_for_mhz(GPU_MIN_FREQ_MHZ).to_string(),
+            );
             let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "0");
             let _ = service_control::write("/sys/module/ged/parameters/gpu_bottom_freq", "338000");
             let _ =
@@ -2006,8 +2033,14 @@ pub fn enforce_performance_profile(profile: i32) -> bool {
                 "/sys/class/misc/mali0/device/devfreq/48000000.mali/governor",
                 "powersave",
             );
-            let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "49");
-            let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "39");
+            let _ = service_control::write(
+                "/sys/kernel/ged/hal/custom_boost_gpu_freq",
+                ged_opp_index_for_mhz(GPU_MIN_FREQ_MHZ).to_string(),
+            );
+            let _ = service_control::write(
+                "/sys/kernel/ged/hal/custom_upbound_gpu_freq",
+                ged_opp_index_for_mhz(GPU_BATTERY_CEILING_MHZ).to_string(),
+            );
             let _ = service_control::write("/sys/module/ged/parameters/gpu_bottom_freq", "338000");
             let _ =
                 service_control::write("/sys/module/ged/parameters/gpu_cust_boost_freq", "338000");
@@ -2043,7 +2076,10 @@ pub fn enforce_performance_profile(profile: i32) -> bool {
                 "/sys/class/misc/mali0/device/devfreq/48000000.mali/governor",
                 "dummy",
             );
-            let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "49");
+            let _ = service_control::write(
+                "/sys/kernel/ged/hal/custom_boost_gpu_freq",
+                ged_opp_index_for_mhz(GPU_MIN_FREQ_MHZ).to_string(),
+            );
             let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "0");
             let _ = service_control::write("/sys/module/ged/parameters/gpu_bottom_freq", "338000");
             let _ =
@@ -2161,12 +2197,21 @@ pub fn apply_performance_profile(profile: i32) -> Result<(), String> {
     }
 }
 
+// Dash ships one touch family, Novatek NT38771 (`nt38771_touch_dash.ko` +
+// `xiaomi_touch_dash.ko`). Historic Goodix/FocalTech codes stay reserved so the
+// protocol keeps working with those panels on ported ROMs; Novatek is code 3.
 fn classify_touch_panel_version(version: &str) -> i32 {
     let version = version.to_ascii_lowercase();
     if version.contains("goodix") || version.contains("gdix") || version.contains("gt9916") {
         1
     } else if version.contains("focal") || version.contains("fts") || version.contains("ft3683") {
         2
+    } else if version.contains("novatek")
+        || version.contains("nt38771")
+        || version.contains("nt36")
+        || version.contains("nvt")
+    {
+        3
     } else {
         0
     }
@@ -2176,9 +2221,21 @@ fn touch_panel_code() -> i32 {
     let version = fs::read_to_string("/proc/tp_fw_version").unwrap_or_default();
     let detected = classify_touch_panel_version(&version);
     if detected != 0 {
-        detected
-    } else if Path::new("/sys/devices/platform/goodix_ts.0").exists() {
+        return detected;
+    }
+    // Dash's Xiaomi touch bridge (`xiaomi_touch_dash.ko`) exposes the touch
+    // supplier through its own class device instead of /proc/tp_fw_version.
+    if let Ok(vendor) = fs::read_to_string("/sys/class/touch/touch_dev/panel_vendor") {
+        let detected = classify_touch_panel_version(&vendor);
+        if detected != 0 {
+            return detected;
+        }
+    }
+    if Path::new("/sys/devices/platform/goodix_ts.0").exists() {
         1
+    } else if Path::new("/sys/class/touch/touch_dev").exists() {
+        // The Xiaomi touch class device only exists on Novatek NT38771 Dash.
+        3
     } else {
         0
     }
@@ -2508,7 +2565,9 @@ fn apply_touch_hal_profile(profile: i32) -> Result<(), String> {
 fn apply_touch_driver_fallback(profile: i32, panel: i32) -> Result<(), String> {
     // The generic HAL is the all-panel route. This fallback keeps 240/480
     // control available on Goodix-based ported ROMs that omit the HAL service.
-    // FocalTech does not expose an equivalent writable report-rate sysfs node.
+    // Dash's Novatek NT38771 driver only accepts report-rate changes through
+    // Xiaomi's TouchFeature HAL or its xm_htc proc nodes, so non-Goodix panels
+    // must use the vendor binder path.
     if profile == 0 {
         return Ok(());
     }
@@ -2955,9 +3014,12 @@ fn migrate_legacy_gpu_profile_cpu_state(state: &mut PersistedState) -> bool {
 }
 
 fn restore_vendor_cpu_defaults() {
+    // Dash ships MediaTek's `sugov_ext` governor as the vendor default (it is
+    // registered by cpufreq_sugov_ext.ko and selected in init.cgroup.rc).
+    // Plain schedutil is only a fallback for ROMs that omit the vendor module.
     for policy in [0, 4, 7] {
-        if set_cpu_governor(policy, "schedutil").is_err() {
-            let _ = set_cpu_governor(policy, "sugov_ext");
+        if set_cpu_governor(policy, "sugov_ext").is_err() {
+            let _ = set_cpu_governor(policy, "schedutil");
         }
     }
     let _ = apply_cluster_freq_controls(0, 339, 2400);
@@ -3912,7 +3974,7 @@ fn apply_display_resolution(
     let native_density = if detected_density > 0 {
         detected_density
     } else {
-        504
+        520
     };
     let target_density = if native {
         native_density
@@ -4599,7 +4661,7 @@ fn gaming_dynamic_guard() {
         // Gaming and Beast own only the Mali cooling device. The vendor thermal
         // services remain running for CPU and platform management while this
         // guard prevents a GPU cooling cap from replacing their 1612 MHz target.
-        let _ = service_control::write("/sys/class/thermal/cooling_device3/cur_state", "0");
+        clear_gpu_cooling_cap();
 
         if profile == 3 {
             // MediaTek's power HAL can publish its stock OPP 49 target after
@@ -5208,6 +5270,86 @@ fn gpu_get_loading() -> i32 {
         .unwrap_or(0)
 }
 
+/// Dash's Mali DVFS ladder is published by the GPUEB firmware and is only
+/// reachable through `/proc/gpufreqv2/`. GED's `custom_boost_gpu_freq` (floor)
+/// and `custom_upbound_gpu_freq` (ceiling) nodes take an index into that
+/// table where `0` is the fastest OPP, so resolve indices from the live table
+/// instead of assuming a fixed 26 MHz ladder.
+const GPU_TOP_FREQ_MHZ: i32 = 1612;
+const GPU_MIN_FREQ_MHZ: i32 = 338;
+const GPU_BATTERY_CEILING_MHZ: i32 = 598;
+const GPU_FREQ_STEP_MHZ: i32 = 26;
+const GPU_OPP_COUNT_FALLBACK: i32 = 52;
+
+/// Parse a gpufreq v2 table dump. Non-privileged lines look like
+/// `[00] freq: 1612000, volt:  80625, vsram:  80625` and the privileged
+/// signed-table variant uses `[00*]`; both carry the frequency in kHz.
+fn parse_gpufreq_opp_table(contents: &str) -> Vec<(i32, i32)> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let (index, rest) = line.trim().strip_prefix('[')?.split_once(']')?;
+            let index = index.trim_end_matches('*').trim().parse::<i32>().ok()?;
+            let (_, rest) = rest.split_once("freq:")?;
+            let freq_khz = rest
+                .split_whitespace()
+                .next()?
+                .trim_end_matches(',')
+                .parse::<i32>()
+                .ok()?;
+            Some((index, freq_khz))
+        })
+        .collect()
+}
+
+fn live_gpu_opp_table() -> Option<&'static [(i32, i32)]> {
+    static TABLE: OnceLock<Option<Vec<(i32, i32)>>> = OnceLock::new();
+    TABLE
+        .get_or_init(|| {
+            for path in [
+                "/proc/gpufreqv2/gpu_working_opp_table",
+                "/proc/gpufreqv2/gpu_signed_opp_table",
+            ] {
+                let Ok(contents) = fs::read_to_string(path) else {
+                    continue;
+                };
+                let table = parse_gpufreq_opp_table(&contents);
+                if !table.is_empty() {
+                    return Some(table);
+                }
+            }
+            None
+        })
+        .as_deref()
+}
+
+/// Exact frequency match wins; otherwise fall back to the nearest ladder step,
+/// preferring the slower OPP on a tie so a ceiling is never loosened.
+fn opp_index_for_freq_mhz(table: &[(i32, i32)], mhz: i32) -> Option<i32> {
+    let target = mhz.saturating_mul(1000);
+    if let Some((index, _)) = table.iter().find(|(_, khz)| *khz == target) {
+        return Some(*index);
+    }
+    table
+        .iter()
+        .min_by_key(|(index, khz)| ((*khz - target).abs(), -*index))
+        .map(|(index, _)| *index)
+}
+
+/// Historic 26 MHz ladder used when the GPUEB table cannot be read.
+fn ged_fallback_opp_index(mhz: i32) -> i32 {
+    ((GPU_TOP_FREQ_MHZ - mhz) / GPU_FREQ_STEP_MHZ).clamp(0, GPU_OPP_COUNT_FALLBACK - 1)
+}
+
+/// Map a frequency to the GED/gpufreq OPP index, reading the live firmware
+/// table when it is available and otherwise assuming the stock 26 MHz ladder.
+fn ged_opp_index_for_mhz(mhz: i32) -> i32 {
+    if let Some(index) = live_gpu_opp_table().and_then(|table| opp_index_for_freq_mhz(table, mhz)) {
+        return index;
+    }
+    ged_fallback_opp_index(mhz)
+}
+
 fn gpu_get_cur_opp_index() -> i32 {
     gpu_read_raw("/sys/kernel/ged/hal/current_freqency")
         .and_then(|value| {
@@ -5265,11 +5407,14 @@ fn parse_ged_current_frequency_mhz(raw: &str) -> Option<i32> {
         .filter_map(|part| part.parse::<i64>().ok())
         .next_back()?;
 
+    // GED reports `oppidx freq` where freq is normally kHz (`51 338000`) but
+    // some builds emit MHz or Hz. Dash's top OPP is 1612 MHz, so anything
+    // above that must be a kHz/Hz reading and needs dividing down.
     if value <= 0 {
         None
     } else if value > 10_000_000 {
         Some((value / 1_000_000) as i32)
-    } else if value > 1_300 {
+    } else if value > 1_612 {
         Some((value / 1_000) as i32)
     } else {
         Some(value as i32)
@@ -5357,7 +5502,7 @@ fn gpu_boost_pipeline_matches(enabled: bool) -> bool {
 }
 
 fn gpu_get_thermal_state() -> i32 {
-    fs::read_to_string("/sys/class/thermal/cooling_device3/cur_state")
+    fs::read_to_string(format!("{}/cur_state", gpu_cooling_device_dir()))
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(-1)
@@ -5475,7 +5620,7 @@ fn set_gpu_min_freq(mhz: i32) -> Result<(), String> {
     }
     let hz = (mhz as u64) * 1_000_000;
     let khz = (mhz as u64) * 1_000;
-    let opp_boost = ((1612 - mhz) / 26).clamp(0, 51);
+    let opp_boost = ged_opp_index_for_mhz(mhz);
     let _ = service_control::write(
         "/sys/kernel/ged/hal/custom_boost_gpu_freq",
         opp_boost.to_string(),
@@ -5514,7 +5659,7 @@ fn set_gpu_max_freq(mhz: i32) -> Result<(), String> {
     }
     let hz = (mhz as u64) * 1_000_000;
     let khz = (mhz as u64) * 1_000;
-    let opp_upbound = ((1612 - mhz) / 26).clamp(0, 51);
+    let opp_upbound = ged_opp_index_for_mhz(mhz);
     let _ = service_control::write(
         "/sys/kernel/ged/hal/custom_upbound_gpu_freq",
         opp_upbound.to_string(),
@@ -5584,7 +5729,10 @@ fn set_gpu_uncap(enable: bool) -> Result<(), String> {
     } else {
         service_control::write("/sys/class/misc/mali0/device/power_policy", "coarse_demand")
             .map_err(|error| format!("GPU power policy write failed: {error}"))?;
-        let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "49");
+        let _ = service_control::write(
+            "/sys/kernel/ged/hal/custom_boost_gpu_freq",
+            ged_opp_index_for_mhz(GPU_MIN_FREQ_MHZ).to_string(),
+        );
         let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "0");
         let _ = service_control::write("/sys/kernel/ged/hal/gpu_boost_level", "0");
         gpu_write_file(
@@ -5955,6 +6103,7 @@ fn snapshot() -> String {
         .unwrap_or(-1);
     let touch_hal = if vendor_binder::touch_available()
         || Path::new("/sys/devices/platform/goodix_ts.0/switch_report_rate").exists()
+        || Path::new("/sys/class/touch/touch_dev").exists()
     {
         1
     } else {
@@ -6890,15 +7039,18 @@ mod tests {
     #[cfg(not(target_os = "android"))]
     use super::run_process_with_timeout;
     use super::{
-        AppUidPolicy, MI_THERMAL_NO_LIMITS_MODE, PersistedState, charging_profile_fcc_ua,
+        AppUidPolicy, GPU_BATTERY_CEILING_MHZ, GPU_MIN_FREQ_MHZ, GPU_TOP_FREQ_MHZ,
+        MI_THERMAL_NO_LIMITS_MODE, PersistedState, charging_profile_fcc_ua,
         classify_touch_panel_version, client_uid_allowed, cpu_frequency_drift_status,
-        find_touch_thp_config_offset, gaming_dynamic_target_opp, mi_thermal_cpu_limit_request,
-        migrate_legacy_gpu_profile_cpu_state, mtk_powerhal_cpu_range_request,
-        normalize_charging_profile, normalize_mi_thermal_config_mode, normalize_reported_power_w,
+        find_touch_thp_config_offset, gaming_dynamic_target_opp, ged_fallback_opp_index,
+        mi_thermal_cpu_limit_request, migrate_legacy_gpu_profile_cpu_state,
+        mtk_powerhal_cpu_range_request, normalize_charging_profile,
+        normalize_mi_thermal_config_mode, normalize_reported_power_w, opp_index_for_freq_mhz,
         package_app_id_from_packages_list, parse_cpu_frequency_table, parse_cpu_time_in_state,
-        parse_ged_current_frequency_mhz, persisted_cpu_ranges_active, profile_uses_ged_boost,
-        scaled_display_density, tcp_client_uid_from_table, touch_hal_profile_sequence,
-        valid_charging_profile, valid_mi_thermal_config_mode, validate_cpu_frequency_range_against,
+        parse_ged_current_frequency_mhz, parse_gpufreq_opp_table, persisted_cpu_ranges_active,
+        profile_uses_ged_boost, scaled_display_density, tcp_client_uid_from_table,
+        touch_hal_profile_sequence, valid_charging_profile, valid_mi_thermal_config_mode,
+        validate_cpu_frequency_range_against,
     };
 
     fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
@@ -7043,10 +7195,68 @@ io.github.neeschal.dashessential 10228 0 /data/user/0/io.github.neeschal.dashess
     }
 
     #[test]
+    fn parses_gpufreq_working_and_signed_opp_tables() {
+        let working = "[00] freq: 1612000, volt:  89000, vsram:  89000\n\
+[01] freq: 1586000, volt:  88500, vsram:  88500\n\
+[51] freq:  338000, volt:  50000, vsram:  50000\n";
+        assert_eq!(
+            parse_gpufreq_opp_table(working),
+            vec![(0, 1_612_000), (1, 1_586_000), (51, 338_000)]
+        );
+
+        let signed = "[00*] freq: 1612000, volt:  89000, vsram:  89000, \
+posdiv: 0, margin:     0, power:     0\n";
+        assert_eq!(parse_gpufreq_opp_table(signed), vec![(0, 1_612_000)]);
+        assert!(parse_gpufreq_opp_table("gpufreq_status: no table here").is_empty());
+    }
+
+    #[test]
+    fn resolves_ged_opp_indices_from_the_live_ladder() {
+        // Stock 26 MHz ladder, including the trailing 338 MHz repeat.
+        let fine: Vec<(i32, i32)> = (0..52)
+            .map(|i| (i, (1_612_000 - i * 26_000).max(338_000)))
+            .collect();
+        assert_eq!(opp_index_for_freq_mhz(&fine, 1612), Some(0));
+        assert_eq!(opp_index_for_freq_mhz(&fine, 598), Some(39));
+        assert_eq!(opp_index_for_freq_mhz(&fine, 338), Some(49));
+        // The stock ladder is reproduced exactly, so live reads never change it.
+        for mhz in [GPU_TOP_FREQ_MHZ, GPU_BATTERY_CEILING_MHZ, GPU_MIN_FREQ_MHZ] {
+            assert_eq!(
+                opp_index_for_freq_mhz(&fine, mhz),
+                Some(ged_fallback_opp_index(mhz))
+            );
+        }
+
+        // Coarser GPUEB binning: exact hits move, and 598 MHz ties between
+        // 624 and 572 MHz must pick the slower OPP.
+        let coarse: Vec<(i32, i32)> = vec![
+            (0, 1_612_000),
+            (4, 1_508_000),
+            (7, 1_430_000),
+            (49, 624_000),
+            (50, 572_000),
+            (51, 338_000),
+        ];
+        assert_eq!(opp_index_for_freq_mhz(&coarse, 1612), Some(0));
+        assert_eq!(opp_index_for_freq_mhz(&coarse, 338), Some(51));
+        assert_eq!(opp_index_for_freq_mhz(&coarse, 598), Some(50));
+    }
+
+    #[test]
+    fn ged_fallback_index_matches_the_historic_formula() {
+        assert_eq!(ged_fallback_opp_index(1612), 0);
+        assert_eq!(ged_fallback_opp_index(598), 39);
+        assert_eq!(ged_fallback_opp_index(338), 49);
+        assert_eq!(ged_fallback_opp_index(0), 51);
+    }
+
+    #[test]
     fn detects_both_dash_touch_panel_families() {
         assert_eq!(classify_touch_panel_version("driver version: gt9916"), 1);
         assert_eq!(classify_touch_panel_version("Goodix GDIX algorithm"), 1);
         assert_eq!(classify_touch_panel_version("FocalTech FT3683G"), 2);
+        assert_eq!(classify_touch_panel_version("Novatek NT38771"), 3);
+        assert_eq!(classify_touch_panel_version("nvt_fw_version"), 3);
         assert_eq!(classify_touch_panel_version("unknown panel"), 0);
     }
 
@@ -7083,10 +7293,10 @@ io.github.neeschal.dashessential 10228 0 /data/user/0/io.github.neeschal.dashess
 
     #[test]
     fn scales_resolution_density_from_the_rom_native_baseline() {
-        assert_eq!(scaled_display_density(504, 1280), 504);
-        assert_eq!(scaled_display_density(504, 1080), 425);
-        assert_eq!(scaled_display_density(504, 720), 284);
-        assert_eq!(scaled_display_density(504, 1440), 567);
+        assert_eq!(scaled_display_density(520, 1280), 520);
+        assert_eq!(scaled_display_density(520, 1080), 439);
+        assert_eq!(scaled_display_density(520, 720), 293);
+        assert_eq!(scaled_display_density(520, 1440), 585);
         assert_eq!(scaled_display_density(440, 1080), 371);
     }
 

@@ -192,6 +192,16 @@ The first two cover the Mali devfreq layouts seen across Dash vendor bases.
 The last path is the Goodix fallback used only when a port omits Xiaomi's touch
 AIDL service.
 
+The Mali devfreq cooler is also registered at a probe-order-dependent
+`cooling_deviceN` index, so the daemon resolves it at runtime by matching
+`/sys/class/thermal/cooling_device*/type` against the name Xiaomi's thermal map
+uses (`devfreq-48000000.mali` in `/vendor/etc/thermald-devices.conf`) and only
+falls back to `cooling_device3`. The GED boost/ceiling nodes themselves take an
+index into the GPUEB DVFS ladder that the firmware publishes through
+`/proc/gpufreqv2/gpu_working_opp_table`, so the daemon maps frequencies to
+indices from that live table and falls back to the stock 26 MHz ladder when the
+node cannot be read.
+
 Never grant the coredomain generic `sysfs:file` write access. If the target
 device tree already labels one of these exact paths, reconcile the duplicate
 `genfscon` entry and grant only that existing dedicated type.
