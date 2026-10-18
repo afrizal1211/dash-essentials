@@ -126,7 +126,7 @@ jobs:
           flutter --version
           flutter config --no-analytics >/dev/null
           flutter precache --android
-          flutter pub get --directory ui/flutter
+          (cd ui/flutter && flutter pub get)
 
       - name: Development signing key
         env:
