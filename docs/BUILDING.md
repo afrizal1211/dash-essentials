@@ -242,17 +242,24 @@ carries a release-signed copy without first removing that application.
 `.github/workflows/build-dash-essential-module.yml` runs the same sequence on an
 Ubuntu x86_64 runner: Flutter 3.44.8, Android platform 36 with build-tools and
 an NDK, `aarch64-linux-android` Rust, the pinned engine prebuilt, then
-`tools/build-kernelsu-next-module.sh` with a development key. It uploads the
-module ZIP, its checksum, and the APK as workflow artifacts, and can be started
-from a tag push or by hand.
+`tools/build-kernelsu-next-module.sh`. It signs releases with the port's own key
+when the `DASH_RELEASE_KEYSTORE_BASE64` and `DASH_RELEASE_KEY_PASS` secrets are
+configured, and otherwise falls back to a throwaway development key. It uploads
+the module ZIP, its checksum, and the APK as workflow artifacts, and can be
+started from a tag push or by hand.
+
+See `android/package/README.md` for the release secrets and for how the
+certificate in `android/package/release-cert.sha256` is verified.
 
 To keep one stable development signature across runs, create a JKS with alias
 `dash-essential-development` and store and key password `android`, base64-encode
 it, and save it as the `DASH_DEV_KEYSTORE_BASE64` repository secret. Without the
 secret each run generates a fresh key, so installs replace each other.
 
-Version 1.18.4 introduces the replacement signing identity. Its public fingerprint
-is recorded in `android/package/release-cert.sha256`. Keep the corresponding
-private keystore outside the repository and retain it for subsequent releases.
-The certificate subject retains its original development name; the fingerprint,
-not that display name, determines Android update compatibility.
+This port carries its own release signing identity, whose public fingerprint is
+recorded in `android/package/release-cert.sha256`. Keep the corresponding private
+keystore outside the repository and retain it for subsequent releases; losing it
+means users can no longer update in place. The upstream Rodin Essential
+certificate is preserved separately in
+`android/package/UPSTREAM_RELEASE_CERT.sha256` for provenance only, and a device
+holding an upstream-signed application will refuse a port-signed update.

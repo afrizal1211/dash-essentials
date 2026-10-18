@@ -35,9 +35,13 @@ ROM-native installation and share its saved daemon controls; removing the
 module restores the ROM APK and init service. Differently signed native
 installations require an update from their ROM maintainer instead.
 
-The public signing identity changed at v1.18.4. Its fingerprint is in
-`android/package/release-cert.sha256`; do not mistake the old v1.18.3 identity
-for the current one. The private release key is not distributed to maintainers.
+The Dash MT6991 port carries its own release signing identity; its fingerprint
+is in `android/package/release-cert.sha256`, and a ROM must ship exactly that
+certificate to be updatable by the public KernelSU Next/Magisk module. The
+upstream Rodin Essential identity is preserved in
+`android/package/UPSTREAM_RELEASE_CERT.sha256` for reference only and is not
+interchangeable with it. The private release key is not distributed to
+maintainers.
 
 ## 2. Export a self-contained bundle
 
