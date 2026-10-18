@@ -13,6 +13,12 @@ privileged Android permissions. Kernel and vendor controls are owned by the
 daemon and reached through authenticated local transports restricted to the
 installed application UID.
 
+> **Source and credits:** Dash Essential is a device port of
+> [Rodin Essential](https://github.com/NEESCHAL-3/Rodin-Essential) by
+> **NEESCHAL-3**, reworked here for the MediaTek MT6991 `dash` platform
+> (POCO X8 Pro Max / REDMI Turbo 5 Max). See
+> [Source and credits](#source-and-credits).
+
 ## Supported target
 
 - Device codename: `dash`
@@ -276,6 +282,50 @@ ui/flutter/             Flutter AOT interface
 - [Flutter runtime pin](docs/FLUTTER_RUNTIME.md)
 - [Commit convention](docs/COMMITS.md)
 
+## Source and credits
+
+Dash Essential is a derivative of **Rodin Essential**, the native
+hardware-control suite for the Xiaomi Rodin (POCO X7 Pro / Redmi Turbo 4,
+MediaTek MT6899, device codename `rodin`) written and maintained by
+**[NEESCHAL-3](https://github.com/NEESCHAL-3)**.
+
+- Original project: <https://github.com/NEESCHAL-3/Rodin-Essential>
+- Upstream release this port is based on: `v1.18.5`
+- Licence of both works: [Apache License, Version 2.0](LICENSE)
+
+This repository reworks that project for the MediaTek MT6991 `dash`
+platform (POCO X8 Pro Max / REDMI Turbo 5 Max). What the port changed:
+
+- CPU and GPU frequency tables, thermal zones and cooling devices, MediaTek
+  GED boost/ceiling OPP indices, UFS and DVFSRC memory nodes, touch and
+  display interfaces, and the display resolution and density baseline were
+  rebuilt against the shipped `dash` kernel, device tree and ROM dump rather
+  than carried over from MT6899.
+- The application package was renamed from
+  `io.github.neeschal.rodinessential` to `io.github.neeschal.dashessential`,
+  the root module id from `nees_rodin_essential_backend` to
+  `nees_dash_essential_backend`, and SELinux type, class and helper names
+  were moved into the `dash_*` namespace.
+- The deliverable of this port is the KernelSU Next / Magisk root module
+  only; the upstream AOSP ROM integration is not built or supported here.
+- Module builds are signed with a local development key, because the
+  upstream release key is not held by this derivative. Those archives carry
+  a `-dev` suffix.
+
+Historical entries in [CHANGELOG.md](CHANGELOG.md) describe upstream
+Rodin Essential releases and keep their original wording.
+
+Third-party components keep their own licences: the Flutter engine
+(BSD 3-Clause, Google LLC), KernelSU Next (GPL-3.0) and Magisk (GPL-3.0).
+
+Full attribution and the modification notice are in [NOTICE](NOTICE).
+
 ## License
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
+
+This repository is a derivative of
+[Rodin Essential](https://github.com/NEESCHAL-3/Rodin-Essential) by
+NEESCHAL-3, Copyright 2026 Rodin Essential Project. The original copyright
+notice is preserved in [LICENSE](LICENSE); the modifications made for the
+MT6991 `dash` port are listed in [NOTICE](NOTICE).

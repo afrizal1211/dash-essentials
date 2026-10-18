@@ -1,0 +1,99 @@
+Dash Essential — attribution and modification notice
+====================================================
+
+This repository is a derivative of Rodin Essential, an original work
+licensed under the Apache License, Version 2.0.
+
+
+Original work
+-------------
+
+  Rodin Essential
+  https://github.com/NEESCHAL-3/Rodin-Essential
+  Author: NEESCHAL-3
+  Copyright 2026 Rodin Essential Project
+  Licence: Apache License, Version 2.0 (the LICENSE file of this repository)
+
+  Rodin Essential is a native hardware-control application and root module
+  for the Xiaomi Rodin (POCO X7 Pro / Redmi Turbo 4) on the MediaTek
+  Dimensity 8400-Ultra platform, device codename `rodin`.
+
+
+This derivative
+--------------
+
+  Dash Essential
+  Copyright 2026 afrizal1221
+  Licence: Apache License, Version 2.0
+
+  Ported to the MediaTek MT6991 platform, device codename `dash`
+  (POCO X8 Pro Max / REDMI Turbo 5 Max), based on upstream release v1.18.5.
+
+  Modifications made in 2026 by afrizal1221:
+
+  * Hardware handling rebuilt against the shipped `dash` kernel, device tree
+    and ROM dump rather than carried over from MT6899: CPU and GPU frequency
+    tables, thermal zones and cooling devices, MediaTek GED boost/ceiling
+    OPP indices, UFS and DVFSRC memory nodes, touch and display interfaces,
+    and the display resolution and density baseline.
+
+  * Package renamed from io.github.neeschal.rodinessential to
+    io.github.neeschal.dashessential; root module id renamed from
+    nees_rodin_essential_backend to nees_dash_essential_backend; SELinux
+    type, class and helper names moved into the `dash_*` namespace; binary
+    and user-facing application and module strings renamed.
+
+  * The deliverable of this derivative is the KernelSU Next / Magisk root
+    module only. The upstream AOSP ROM integration is not built, tested or
+    supported by this derivative.
+
+  * The upstream release signing key is not held by this derivative, so
+    module builds are signed with a local development key and carry a `-dev`
+    suffix in the archive name.
+
+  * Undocumented MT6899 fallback values were removed where a `dash` value
+    could not be read at runtime: the daemon skips the control write rather
+    than guessing at a value.
+
+  * The upstream Flutter embedder engine release (v1.18.5) is reused
+    verbatim as the pinned Dart/AOT runtime for this derivative; the pin is
+    recorded in tools/fetch-flutter-engine-prebuilt.sh.
+
+  Per-release details are recorded in CHANGELOG.md. Historical entries in
+  CHANGELOG.md describe upstream Rodin Essential releases and are retained
+  in their original wording.
+
+
+Third-party components
+----------------------
+
+  Flutter and the Flutter engine
+    Copyright Google LLC and contributors.
+    BSD 3-Clause Licence.
+
+  KernelSU Next (built for, not bundled)
+    https://github.com/KernelSU-Next/KernelSU-Next
+    GPL-3.0
+
+  Magisk (built for, not bundled)
+    https://github.com/topjohnwu/Magisk
+    GPL-3.0
+
+
+Apache License notice
+---------------------
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+
+  This NOTICE file is provided for attribution under section 4 of the
+  Apache License, Version 2.0.
