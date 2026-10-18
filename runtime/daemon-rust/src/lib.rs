@@ -1907,12 +1907,11 @@ fn write_beast_gpu_constraints() {
     let _ = service_control::write("/sys/module/ged/parameters/ged_smart_boost", "1");
     let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "0");
     let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "0");
-    let _ = service_control::write("/sys/module/ged/parameters/gpu_bottom_freq", "1612000");
-    let _ = service_control::write("/sys/module/ged/parameters/gpu_cust_boost_freq", "1612000");
-    let _ = service_control::write(
-        "/sys/module/ged/parameters/gpu_cust_upbound_freq",
-        "1612000",
-    );
+    // The `gpu_bottom_freq`/`gpu_cust_*_freq` module parameters are reporting
+    // only: ged_dvfs.c assigns them from the OPP it just committed and never
+    // reads them back, and no vendor library or binary on Dash references them.
+    // The real controls are the two `custom_*_gpu_freq` indices above and the
+    // devfreq min/max nodes below.
     let _ = gpu_write_file(
         "/sys/class/devfreq/48000000.mali/max_freq",
         "/sys/class/misc/mali0/device/devfreq/48000000.mali/max_freq",
@@ -2004,13 +2003,6 @@ pub fn enforce_performance_profile(profile: i32) -> bool {
             // Index 0 is the fastest OPP of every GPUEB ladder, so it needs no
             // table lookup: it lifts this profile's ceiling out of the way.
             let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "0");
-            let _ = service_control::write("/sys/module/ged/parameters/gpu_bottom_freq", "338000");
-            let _ =
-                service_control::write("/sys/module/ged/parameters/gpu_cust_boost_freq", "338000");
-            let _ = service_control::write(
-                "/sys/module/ged/parameters/gpu_cust_upbound_freq",
-                "1612000",
-            );
             let _ =
                 service_control::write("/sys/class/misc/mali0/device/power_policy", "always_on");
             let _ = service_control::write("/sys/kernel/ged/hal/gpu_boost_level", "1");
@@ -2046,13 +2038,6 @@ pub fn enforce_performance_profile(profile: i32) -> bool {
                 "/sys/kernel/ged/hal/custom_upbound_gpu_freq",
                 GPU_BATTERY_CEILING_MHZ,
                 FreqBound::AtMost,
-            );
-            let _ = service_control::write("/sys/module/ged/parameters/gpu_bottom_freq", "338000");
-            let _ =
-                service_control::write("/sys/module/ged/parameters/gpu_cust_boost_freq", "338000");
-            let _ = service_control::write(
-                "/sys/module/ged/parameters/gpu_cust_upbound_freq",
-                "598000",
             );
             let _ = service_control::write(
                 "/sys/class/misc/mali0/device/power_policy",
@@ -2090,13 +2075,6 @@ pub fn enforce_performance_profile(profile: i32) -> bool {
             // Index 0 is the fastest OPP of every GPUEB ladder, so it needs no
             // table lookup: it lifts this profile's ceiling out of the way.
             let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "0");
-            let _ = service_control::write("/sys/module/ged/parameters/gpu_bottom_freq", "338000");
-            let _ =
-                service_control::write("/sys/module/ged/parameters/gpu_cust_boost_freq", "338000");
-            let _ = service_control::write(
-                "/sys/module/ged/parameters/gpu_cust_upbound_freq",
-                "1612000",
-            );
             let _ = service_control::write(
                 "/sys/class/misc/mali0/device/power_policy",
                 "coarse_demand",
@@ -5710,7 +5688,6 @@ fn set_gpu_min_freq(mhz: i32) -> Result<(), String> {
         return Err("GPU minimum frequency must be 338-1612 MHz".into());
     }
     let hz = (mhz as u64) * 1_000_000;
-    let khz = (mhz as u64) * 1_000;
     write_ged_opp_index(
         "/sys/kernel/ged/hal/custom_boost_gpu_freq",
         mhz,
@@ -5721,14 +5698,6 @@ fn set_gpu_min_freq(mhz: i32) -> Result<(), String> {
         "/sys/class/misc/mali0/device/devfreq/48000000.mali/min_freq",
         &hz.to_string(),
     )?;
-    let _ = service_control::write(
-        "/sys/module/ged/parameters/gpu_bottom_freq",
-        khz.to_string(),
-    );
-    let _ = service_control::write(
-        "/sys/module/ged/parameters/gpu_cust_boost_freq",
-        khz.to_string(),
-    );
     if gpu_get_min_freq_mhz() != mhz {
         return Err(format!(
             "GPU minimum frequency verify failed: requested {mhz} MHz, live {} MHz",
@@ -5749,7 +5718,6 @@ fn set_gpu_max_freq(mhz: i32) -> Result<(), String> {
         return Err("GPU maximum frequency must be 338-1612 MHz".into());
     }
     let hz = (mhz as u64) * 1_000_000;
-    let khz = (mhz as u64) * 1_000;
     write_ged_opp_index(
         "/sys/kernel/ged/hal/custom_upbound_gpu_freq",
         mhz,
@@ -5760,10 +5728,6 @@ fn set_gpu_max_freq(mhz: i32) -> Result<(), String> {
         "/sys/class/misc/mali0/device/devfreq/48000000.mali/max_freq",
         &hz.to_string(),
     )?;
-    let _ = service_control::write(
-        "/sys/module/ged/parameters/gpu_cust_upbound_freq",
-        khz.to_string(),
-    );
     if gpu_get_max_freq_mhz() != mhz {
         return Err(format!(
             "GPU maximum frequency verify failed: requested {mhz} MHz, live {} MHz",
@@ -5837,12 +5801,6 @@ fn set_gpu_uncap(enable: bool) -> Result<(), String> {
             "/sys/class/misc/mali0/device/devfreq/48000000.mali/max_freq",
             "1612000000",
         )?;
-        let _ = service_control::write("/sys/module/ged/parameters/gpu_bottom_freq", "338000");
-        let _ = service_control::write("/sys/module/ged/parameters/gpu_cust_boost_freq", "338000");
-        let _ = service_control::write(
-            "/sys/module/ged/parameters/gpu_cust_upbound_freq",
-            "1612000",
-        );
         let _ = service_control::write("/sys/module/ged/parameters/gpu_dvfs_enable", "1");
         let _ = service_control::write("/sys/module/ged/parameters/ged_boost_enable", "0");
         let _ = service_control::write("/sys/module/ged/parameters/boost_gpu_enable", "0");
