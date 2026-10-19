@@ -16,8 +16,9 @@ installed application UID.
 > **Source and credits:** Dash Essential is a device port of
 > [Rodin Essential](https://github.com/NEESCHAL-3/Rodin-Essential) by
 > **NEESCHAL-3**, reworked here for the MediaTek MT6991 `dash` platform
-> (POCO X8 Pro Max / REDMI Turbo 5 Max). See
-> [Source and credits](#source-and-credits).
+> (POCO X8 Pro Max / REDMI Turbo 5 Max) against the
+> [xiaomi-mt6991](https://github.com/xiaomi-mt6991) device tree and hardware
+> interface sources. See [Source and credits](#source-and-credits).
 
 ## Supported target
 
@@ -292,6 +293,20 @@ MediaTek MT6899, device codename `rodin`) written and maintained by
 - Original project: <https://github.com/NEESCHAL-3/Rodin-Essential>
 - Upstream release this port is based on: `v1.18.5`
 - Licence of both works: [Apache License, Version 2.0](LICENSE)
+
+The `dash` device tree, vendor hardware interfaces and ROM wiring this port
+was rebuilt against come from the **xiaomi-mt6991** community repositories:
+
+- Device tree: <https://github.com/xiaomi-mt6991/device_xiaomi_dash>
+- Hardware interfaces — TouchFeature, DisplayFeature, sensors and
+  fingerprint: <https://github.com/xiaomi-mt6991/hardware_xiaomi>
+- Manifest overlays: <https://github.com/xiaomi-mt6991/local_manifests>
+- Organisation: <https://github.com/xiaomi-mt6991>
+
+Those works are maintained by **the LineageOS Project and the xiaomi-mt6991
+maintainers** and are licensed under the Apache License, Version 2.0. They
+are credited here as the hardware reference for this port; their own
+licences and notices govern those repositories.
 
 This repository reworks that project for the MediaTek MT6991 `dash`
 platform (POCO X8 Pro Max / REDMI Turbo 5 Max). What the port changed:

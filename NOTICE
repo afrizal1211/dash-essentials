@@ -64,6 +64,27 @@ This derivative
   in their original wording.
 
 
+Reference sources
+-----------------
+
+  Xiaomi MT6991 device tree and hardware interfaces
+    https://github.com/xiaomi-mt6991
+      device_xiaomi_dash   — the `dash` device tree
+      hardware_xiaomi      — TouchFeature, DisplayFeature, sensors,
+                             fingerprint and other vendor interfaces
+      local_manifests      — ROM manifest overlays
+
+    Author: The LineageOS Project and the xiaomi-mt6991 maintainers
+    Copyright The LineageOS Project
+    Licence: Apache License, Version 2.0 (per-file SPDX headers)
+
+    Consulted as the hardware reference for this port: device tree wiring,
+    the vendor interface definitions and method order the daemon's binder
+    calls were written against, and the vendor node and property names used
+    throughout. Their own LICENSE and NOTICE files govern those
+    repositories.
+
+
 Third-party components
 ----------------------
 
