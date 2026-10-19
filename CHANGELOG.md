@@ -46,6 +46,57 @@ original wording.
   pinned as the Dart/AOT runtime by `tools/fetch-flutter-engine-prebuilt.sh`.
 
 
+## 1.18.6
+
+Codename: Aurora.
+
+### Fixed
+
+- Changing the GPU performance profile could fail permanently and name a cause
+  that did not exist. The per-app ownership map also carries recovery tokens
+  written when a daemon restart or a failed restore left an override half
+  applied, and the global-command gate treated any key in that map as a
+  foreground profile holding the control. `SET perf` was therefore rejected
+  with a message blaming an app that was not running, and nothing ever cleared
+  the key. The gate now asks who actually owns the control: only an applied
+  foreground profile blocks a global change, a pending restore says so, and a
+  stale recovery token no longer locks the GPU out for the rest of the
+  session. Per-app recovery also restores every control instead of aborting at
+  the first failure, which is what stranded those tokens.
+- The diagnostics screen marked "System Optimizations" as failed for a live GPU
+  profile. The apply path accepted a profile under a vendor thermal ceiling but
+  published `perf_verify_ok` from the stricter check, so the screen read
+  `0 / 1 active` for a profile that was correctly in force. The apply and the
+  background guard now publish the same verdict.
+- A transient servicemanager miss was reported as a missing controller. The
+  touch apply fell through to a fallback that can only fail on a non-Goodix
+  panel, and the health screen could show Touch Controller and Display Engine
+  as Unavailable while the HAL was fine. Both the apply and the snapshot now
+  retry briefly before concluding that a HAL is gone.
+- The touch fallback message no longer implies that the panel cannot do
+  240/480. Dash's Novatek driver can; what was missing is the vendor HAL, the
+  only route to it, and the panel has no generic report-rate node. The error
+  code the application displays is unchanged.
+- The in-memory touch timing notice no longer repeats on every keepalive
+  apply. It is logged when the reason changes and cleared after a successful
+  patch, which turns 124 identical lines per boot into one.
+
+### Added
+
+- Settings changes that fail, or that answer `OK` without the hardware
+  actually moving, are recorded as `DASH_SETTING_PROBLEM` in the module log,
+  beside the touch diagnostics. GPU profile, governor, power policy, min and
+  max frequency and uncap requests are read back after the write, so "the app
+  says it changed" and "it changed" are no longer the same claim. Each problem
+  is logged once when it appears and again only after it clears.
+- Uninstalling the module from KernelSU Manager removes
+  `/data/adb/dash-essential`: the settings file, the service intent, the clock
+  originals, the per-app profiles and their recovery journal, the watchdog lock
+  and the log. ROM-native installs keep the ROM's own state in
+  `/data/system/dash-essential` and drop only module-owned artifacts. A
+  contract test keeps the cleanup from regressing.
+
+
 ## 1.18.5
 
 Codename: Aurora.

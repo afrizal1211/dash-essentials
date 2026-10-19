@@ -120,6 +120,10 @@ grep -Fq 'uninstall-system-updates "$DASH_PACKAGE"' "$DASH_STAGE/uninstall.sh" |
     echo "Missing ROM-native application rollback path" >&2
     exit 1
 }
+grep -Fq 'rm -rf "$DASH_ROOT"' "$DASH_STAGE/uninstall.sh" || {
+    echo "Uninstall leaves module state under /data/adb behind" >&2
+    exit 1
+}
 
 DASH_MODID="$(sed -n 's/^id=//p' "$DASH_STAGE/module.prop")"
 DASH_VERSION_CODE="$(sed -n 's/^versionCode=//p' "$DASH_STAGE/module.prop")"

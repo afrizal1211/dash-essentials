@@ -44,6 +44,17 @@ grep -Fq 'rom-native-mode' "$DASH_INSTALLER"
 grep -Fq 'update layer over the ROM-native installation' "$DASH_INSTALLER"
 grep -Fq 'uninstall-system-updates "$DASH_PACKAGE"' "$DASH_MODULE/uninstall.sh"
 grep -Fq 'ctl.start' "$DASH_MODULE/uninstall.sh"
+# Removing the module from KernelSU Manager must not leave module state under
+# /data/adb: the settings file, the service intent, the clock originals, the
+# per-app profiles and their recovery journal, the watchdog lock and the log.
+grep -Fq 'rm -rf "$DASH_ROOT"' "$DASH_MODULE/uninstall.sh" || {
+    echo "Uninstall leaves /data/adb/dash-essential behind" >&2
+    exit 1
+}
+grep -Fq 'app-recovery.json' "$DASH_MODULE/uninstall.sh" || {
+    echo "Uninstall leaves the per-app recovery journal behind" >&2
+    exit 1
+}
 grep -Fq 'App IPC: verified (daemon-initiated)' "$DASH_ACTION"
 grep -Fq 'App IPC: verified (authenticated loopback)' "$DASH_ACTION"
 grep -Fq 'INSTALL_FAILED_UPDATE_INCOMPATIBLE' "$DASH_INSTALLER"

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -2168,9 +2169,13 @@ pub fn apply_performance_profile(profile: i32) -> Result<(), String> {
 
     PERFORMANCE_PROFILE_SUPPORTED.store(1, Ordering::Release);
     PERFORMANCE_PROFILE_VERIFIED.store(1, Ordering::Release);
-    PERFORMANCE_PROFILE_OK.store(if verified { 1 } else { 0 }, Ordering::Release);
+    // Publish the acceptance the return value uses. Reporting `0` here while
+    // returning Ok leaves the diagnostics screen marking "System Optimizations"
+    // as failed for a profile that is live.
+    let accepted = gpu_profile_accepted(profile);
+    PERFORMANCE_PROFILE_OK.store(i32::from(accepted), Ordering::Release);
 
-    if verified || gpu_profile_configured(profile) {
+    if accepted {
         Ok(())
     } else {
         Err(format!(
@@ -2567,7 +2572,13 @@ fn apply_touch_driver_fallback(profile: i32, panel: i32) -> Result<(), String> {
     }
 
     if panel != 1 {
-        return Err("Dash TouchFeature HAL unavailable for this panel".into());
+        // Two separate facts used to be collapsed into one sentence that read
+        // as if the panel could not do 240/480 at all. Dash's Novatek driver
+        // can; what is missing is the vendor HAL that is the only route to it,
+        // and this panel has no generic report-rate node to fall back to.
+        return Err(format!(
+            "Dash TouchFeature HAL unavailable; panel {panel} has no generic report-rate route"
+        ));
     }
 
     if !matches!(profile, 1 | 2) {
@@ -2596,6 +2607,40 @@ fn apply_touch_driver_fallback(profile: i32, panel: i32) -> Result<(), String> {
 
 fn touch_last_error() -> &'static Mutex<String> {
     TOUCH_LAST_ERROR.get_or_init(|| Mutex::new(String::new()))
+}
+
+fn touch_thp_notice() -> &'static Mutex<String> {
+    TOUCH_THP_NOTICE.get_or_init(|| Mutex::new(String::new()))
+}
+
+/// The in-memory THP timing block is optional on this panel, so its absence is
+/// reported on every apply. The keepalive re-applies in a loop, and an
+/// unfiltered notice buried the daemon log (124 identical lines in one boot).
+/// Log it only when the reason actually changes.
+fn record_touch_thp_notice(error: &str) {
+    let changed = touch_thp_notice()
+        .lock()
+        .map(|mut slot| {
+            if slot.as_str() == error {
+                false
+            } else {
+                slot.clear();
+                slot.push_str(error);
+                true
+            }
+        })
+        .unwrap_or(true);
+    if changed {
+        eprintln!("DASH_TOUCH_THP_UNAVAILABLE {error}");
+    }
+}
+
+/// Forget the last reported reason so a later failure is logged again after a
+/// successful patch in between.
+fn clear_touch_thp_notice() {
+    if let Ok(mut slot) = touch_thp_notice().lock() {
+        slot.clear();
+    }
 }
 
 fn touch_error_text() -> String {
@@ -2692,6 +2737,29 @@ fn apply_touch_profile_locked(profile: i32) -> Result<(), String> {
     result
 }
 
+/// Probe a vendor HAL through servicemanager with a short retry.
+///
+/// servicemanager answers with a transient miss while a HAL is restarting.
+/// A single miss is not evidence that the service is gone, so neither the
+/// apply path nor the health snapshot may treat it as one: the apply would
+/// fall through to a fallback that can only fail on a non-Goodix panel, and
+/// the diagnostics screen would mark a working controller as Unavailable.
+fn vendor_service_available(probe: fn() -> bool, attempts: u32, delay_ms: u64) -> bool {
+    for attempt in 0..attempts {
+        if probe() {
+            return true;
+        }
+        if attempt + 1 < attempts {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+        }
+    }
+    false
+}
+
+fn touch_hal_available() -> bool {
+    vendor_service_available(vendor_binder::touch_available, 3, 25)
+}
+
 fn apply_touch_profile_locked_inner(profile: i32) -> Result<(), String> {
     service_control::remember("touch.hal", serde_json::json!(true))?;
 
@@ -2701,7 +2769,7 @@ fn apply_touch_profile_locked_inner(profile: i32) -> Result<(), String> {
     // physical touch path continue normally.
     let _ = touch_resampler::set_target_hz(0);
     let panel = touch_panel_code();
-    let control_path = if vendor_binder::touch_available() {
+    let control_path = if touch_hal_available() {
         let resampled = profile == 3;
         let vendor_profile = if resampled { 2 } else { profile };
         let locked_rate = touch_profile_locked_rate(profile);
@@ -2712,9 +2780,14 @@ fn apply_touch_profile_locked_inner(profile: i32) -> Result<(), String> {
         // through `touch_error`/`touch_error_code` instead.
         let layout_and_expected_rate = match locked_rate {
             Some(rate) => match write_touch_thp_rate(rate) {
-                Ok(layout) => Some((layout, rate)),
+                Ok(layout) => {
+                    // Clear the reported reason so a later failure is logged
+                    // again instead of being swallowed as a repeat.
+                    clear_touch_thp_notice();
+                    Some((layout, rate))
+                }
                 Err(error) => {
-                    eprintln!("DASH_TOUCH_THP_UNAVAILABLE {error}");
+                    record_touch_thp_notice(&error);
                     None
                 }
             },
@@ -2926,6 +2999,7 @@ static DISPLAY_APPLY_ACK: AtomicI32 = AtomicI32::new(-1);
 static TOUCH_APPLY_ACK: AtomicI32 = AtomicI32::new(-1);
 static TOUCH_ERROR_CODE: AtomicI32 = AtomicI32::new(0);
 static TOUCH_LAST_ERROR: OnceLock<Mutex<String>> = OnceLock::new();
+static TOUCH_THP_NOTICE: OnceLock<Mutex<String>> = OnceLock::new();
 static KEEPALIVE_APPLY_ACK: AtomicI32 = AtomicI32::new(-1);
 static KEEPALIVE_APPLY_COUNT: AtomicI32 = AtomicI32::new(0);
 static CPU_WRITE_ACK: AtomicI32 = AtomicI32::new(-1);
@@ -4623,11 +4697,7 @@ fn reassert_persisted_governors() {
 
     PERFORMANCE_PROFILE_VERIFIED.store(1, Ordering::Release);
     PERFORMANCE_PROFILE_OK.store(
-        if gpu_profile_verified(state.perf) {
-            1
-        } else {
-            0
-        },
+        i32::from(gpu_profile_accepted(state.perf)),
         Ordering::Release,
     );
 
@@ -5788,6 +5858,17 @@ fn gpu_profile_configured(profile: i32) -> bool {
     }
 }
 
+/// A profile is in force when it is exactly as requested (`verified`) or when
+/// it is as requested under a state the platform is entitled to impose on a
+/// correct apply (`configured`: a vendor thermal ceiling on the frequency
+/// ladder). The apply path and the background guard must publish this same
+/// verdict, otherwise `perf_verify_ok` reads `0` for a profile the daemon
+/// already accepted and the diagnostics screen shows a failed check for a
+/// subsystem that is working.
+fn gpu_profile_accepted(profile: i32) -> bool {
+    gpu_profile_verified(profile) || gpu_profile_configured(profile)
+}
+
 fn set_gpu_min_freq(mhz: i32) -> Result<(), String> {
     if !(338..=1612).contains(&mhz) {
         return Err("GPU minimum frequency must be 338-1612 MHz".into());
@@ -6258,7 +6339,9 @@ fn snapshot() -> String {
             ((voltage as i128 * (current as i128).abs()) / 1_000_000_000) as i64
         })
         .unwrap_or(-1);
-    let touch_hal = if vendor_binder::touch_available()
+    // One transient servicemanager miss must not be published as an
+    // Unavailable controller on the health screen while the HAL is fine.
+    let touch_hal = if vendor_service_available(vendor_binder::touch_available, 2, 15)
         || Path::new("/sys/devices/platform/goodix_ts.0/switch_report_rate").exists()
         || Path::new("/sys/class/touch/touch_dev").exists()
     {
@@ -6266,7 +6349,7 @@ fn snapshot() -> String {
     } else {
         0
     };
-    let display_hal = if vendor_binder::display_available() {
+    let display_hal = if vendor_service_available(vendor_binder::display_available, 2, 15) {
         1
     } else {
         0
@@ -6704,6 +6787,141 @@ fn transition_service(cmd: &str) -> Result<(), String> {
 
 pub fn handle_command(line: &str) -> String {
     let cmd = line.trim();
+    let response = dispatch_command(cmd);
+    audit_settings_change(cmd, &response);
+    response
+}
+
+/// Problems the app asked for and did not get, keyed by command. The keepalive
+/// re-applies settings in a loop, so a problem is logged once when it appears
+/// and again only after it has cleared.
+static SETTING_PROBLEMS: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
+
+fn setting_problems() -> &'static Mutex<BTreeMap<String, String>> {
+    SETTING_PROBLEMS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn record_setting_problem(key: &str, detail: &str) {
+    let changed = setting_problems()
+        .lock()
+        .map(|mut problems| match problems.get(key) {
+            Some(last) if last.as_str() == detail => false,
+            _ => {
+                problems.insert(key.to_string(), detail.to_string());
+                true
+            }
+        })
+        .unwrap_or(true);
+    if changed {
+        eprintln!("DASH_SETTING_PROBLEM {key} {detail}");
+    }
+}
+
+fn clear_setting_problem(key: &str) {
+    if let Ok(mut problems) = setting_problems().lock() {
+        problems.remove(key);
+    }
+}
+
+/// The app shows the outcome of every settings command, so a change it could
+/// not apply has to be visible in a log the user can send back. The daemon's
+/// stderr is the module log (`backend.log`), which already carries the touch
+/// diagnostics, so a settings failure and the touch failure it caused read in
+/// one file, in order.
+fn audit_settings_change(cmd: &str, response: &str) {
+    if !(cmd.starts_with("SET ") || cmd.starts_with("ACTION ")) {
+        return;
+    }
+    let key = command_key(cmd);
+    if let Some(error) = response.strip_prefix("ERR ") {
+        record_setting_problem(&key, &format!("error={error}"));
+        return;
+    }
+    if !response.starts_with("OK") {
+        return;
+    }
+    match settings_readback_mismatch(cmd) {
+        Some(mismatch) => record_setting_problem(&key, &format!("unchanged {mismatch}")),
+        None => clear_setting_problem(&key),
+    }
+}
+
+fn command_key(cmd: &str) -> String {
+    let mut parts = cmd.split_whitespace();
+    format!(
+        "{} {}",
+        parts.next().unwrap_or_default(),
+        parts.next().unwrap_or_default()
+    )
+}
+
+/// Read back the control a settings command claims to have changed.
+///
+/// A command can answer `OK` because the write was issued, not because the
+/// hardware accepted it; comparing the request against the live node is what
+/// turns "the app says it changed" into "it changed". Controls with no
+/// readable node report nothing here, and controls that cannot be written at
+/// all are already covered by the touch diagnostics in the same log.
+fn settings_readback_mismatch(cmd: &str) -> Option<String> {
+    let mut parts = cmd.split_whitespace();
+    let verb = parts.next().unwrap_or_default();
+    let name = parts.next().unwrap_or_default();
+    let arg = parts.next().unwrap_or_default().to_string();
+    if verb != "SET" {
+        return None;
+    }
+    match name {
+        "perf" => {
+            let profile = arg.parse::<i32>().ok()?;
+            gpu_profile_accepted(profile).then(|| {
+                format!(
+                    "gpu profile {profile} not in force: governor={} dvfs={} power_policy={}",
+                    gpu_get_governor(),
+                    gpu_get_dvfs_enabled(),
+                    gpu_get_power_policy()
+                )
+            })
+        }
+        "gpu.governor" => (gpu_get_governor() != arg)
+            .then(|| format!("governor={} requested={arg}", gpu_get_governor())),
+        "gpu.power_policy" => (gpu_get_power_policy() != arg)
+            .then(|| format!("power_policy={} requested={arg}", gpu_get_power_policy())),
+        "gpu.min_freq" => {
+            let requested = arg.parse::<i32>().ok()?;
+            (gpu_get_min_freq_mhz() != requested)
+                .then(|| format!("min_freq={} requested={requested}", gpu_get_min_freq_mhz()))
+        }
+        "gpu.max_freq" => {
+            let requested = arg.parse::<i32>().ok()?;
+            (gpu_get_max_freq_mhz() != requested)
+                .then(|| format!("max_freq={} requested={requested}", gpu_get_max_freq_mhz()))
+        }
+        "gpu.uncap" => {
+            // Deliberately not `gpu_get_uncap_active()`: that also requires the
+            // instantaneous clock to read 1612, which lags the write for a
+            // moment and would report a change that did take effect.
+            let requested = arg.parse::<i32>().ok()?;
+            let in_force = gpu_get_min_freq_mhz() == 1612
+                && gpu_get_max_freq_mhz() == 1612
+                && gpu_get_governor() == "performance"
+                && gpu_get_dvfs_enabled() == 0
+                && gpu_get_power_policy() == "always_on";
+            (requested == 1 && !in_force).then(|| {
+                format!(
+                    "uncap not in force: governor={} min={} max={} dvfs={} policy={}",
+                    gpu_get_governor(),
+                    gpu_get_min_freq_mhz(),
+                    gpu_get_max_freq_mhz(),
+                    gpu_get_dvfs_enabled(),
+                    gpu_get_power_policy()
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
+fn dispatch_command(cmd: &str) -> String {
     if subsystem_clocks::is_command(cmd) {
         let _gate = match service_control::GATE.write() {
             Ok(gate) => gate,
@@ -6764,7 +6982,7 @@ pub fn handle_command(line: &str) -> String {
             }
         }
     }
-    handle_enabled_command(line)
+    handle_enabled_command(cmd)
 }
 
 fn handle_enabled_command(line: &str) -> String {
@@ -7198,14 +7416,16 @@ mod tests {
     use super::{
         AppUidPolicy, FreqBound, GPU_BATTERY_CEILING_MHZ, GPU_MIN_FREQ_MHZ,
         MI_THERMAL_NO_LIMITS_MODE, PersistedState, charging_profile_fcc_ua,
-        classify_touch_panel_version, client_uid_allowed, cpu_frequency_drift_status,
+        classify_touch_panel_version, client_uid_allowed, command_key,
+        cpu_frequency_drift_status,
         find_touch_thp_config_offset, gaming_dynamic_target_opp, mi_thermal_cpu_limit_request,
         migrate_legacy_gpu_profile_cpu_state, mtk_powerhal_cpu_range_request,
         normalize_charging_profile, normalize_mi_thermal_config_mode, normalize_reported_power_w,
         opp_index_for_freq_mhz, opp_index_stepped_by_levels, package_app_id_from_packages_list,
         parse_cpu_frequency_table, parse_cpu_time_in_state, parse_ged_current_frequency_mhz,
         parse_gpufreq_opp_table, persisted_cpu_ranges_active, profile_uses_ged_boost,
-        scaled_display_density, snapshot_safe_text, tcp_client_uid_from_table,
+        scaled_display_density, settings_readback_mismatch, snapshot_safe_text,
+        tcp_client_uid_from_table,
         touch_error_code_for, touch_hal_profile_sequence,
         valid_charging_profile, valid_mi_thermal_config_mode, validate_cpu_frequency_range_against,
     };
@@ -7544,6 +7764,14 @@ posdiv: 0, margin:     0, power:     0\n";
         assert_eq!(touch_error_code_for("THP timing block not found"), 2);
         assert_eq!(touch_error_code_for("libtouchreport_hal.so is not mapped"), 2);
         assert_eq!(touch_error_code_for("TouchFeature HAL unavailable"), 1);
+        // The panel wording changed but the error code must not: the app maps
+        // its labels from the code, not from the message text.
+        assert_eq!(
+            touch_error_code_for(
+                "Dash TouchFeature HAL unavailable; panel 3 has no generic report-rate route"
+            ),
+            1
+        );
         assert_eq!(touch_error_code_for("something unexpected"), 5);
     }
 
@@ -7557,6 +7785,27 @@ posdiv: 0, margin:     0, power:     0\n";
         assert!(!s.contains('\n'));
 
         assert_eq!(snapshot_safe_text(&"e".repeat(500)).len(), 120);
+    }
+
+    #[test]
+    fn settings_audit_names_the_command_without_its_argument() {
+        assert_eq!(command_key("SET perf 2"), "SET perf");
+        assert_eq!(command_key("SET gpu.governor performance"), "SET gpu.governor");
+        assert_eq!(
+            command_key("ACTION gpu.uncap_full_speed"),
+            "ACTION gpu.uncap_full_speed"
+        );
+    }
+
+    #[test]
+    fn settings_audit_ignores_commands_with_no_readable_node() {
+        // A command the audit cannot read back must not be reported as a
+        // change that failed, and an unparseable argument must not panic the
+        // command path the app is waiting on.
+        assert!(settings_readback_mismatch("SET display.color 1").is_none());
+        assert!(settings_readback_mismatch("SET perf not-a-number").is_none());
+        assert!(settings_readback_mismatch("SET gpu.min_freq 5x").is_none());
+        assert!(settings_readback_mismatch("ACTION gpu.uncap_full_speed").is_none());
     }
 
     #[test]

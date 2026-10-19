@@ -860,35 +860,56 @@ pub(super) fn command(cmd: &str) -> Result<Value, String> {
     Ok(status(&r))
 }
 pub(super) fn check_global_command(cmd: &str) -> Result<(), String> {
-    let entries = originals()
-        .lock()
-        .map_err(|_| "per-app ownership lock poisoned")?;
-    let owned = if cmd.starts_with("SET touch ") {
-        entries.contains_key("touch")
-    } else if cmd.starts_with("SET perf ")
-        || cmd.starts_with("SET gpu.")
-        || cmd.starts_with("ACTION gpu.")
-    {
-        entries.contains_key("gpu")
-    } else if cmd.starts_with("SET cpu.manual ") || cmd.starts_with("SET cpu.core ") {
-        entries.contains_key("cores")
-    } else if cmd.starts_with("SET cpu.") || cmd.starts_with("ACTION cpu.") {
-        let parts: Vec<_> = cmd.split_whitespace().collect();
-        let prefix = if cmd.starts_with("SET cpu.gov ") {
-            "governor"
+    let owned = {
+        // Scope the map guard: `command()` locks the runtime before this map,
+        // so it must not be held while the runtime is taken here.
+        let entries = originals()
+            .lock()
+            .map_err(|_| "per-app ownership lock poisoned")?;
+        if cmd.starts_with("SET touch ") {
+            entries.contains_key("touch")
+        } else if cmd.starts_with("SET perf ")
+            || cmd.starts_with("SET gpu.")
+            || cmd.starts_with("ACTION gpu.")
+        {
+            entries.contains_key("gpu")
+        } else if cmd.starts_with("SET cpu.manual ") || cmd.starts_with("SET cpu.core ") {
+            entries.contains_key("cores")
+        } else if cmd.starts_with("SET cpu.") || cmd.starts_with("ACTION cpu.") {
+            let parts: Vec<_> = cmd.split_whitespace().collect();
+            let prefix = if cmd.starts_with("SET cpu.gov ") {
+                "governor"
+            } else {
+                "range"
+            };
+            parts
+                .get(2)
+                .is_some_and(|p| entries.contains_key(&format!("{prefix}{p}")))
         } else {
-            "range"
-        };
-        parts
-            .get(2)
-            .is_some_and(|p| entries.contains_key(&format!("{prefix}{p}")))
-    } else {
-        false
+            false
+        }
     };
-    if owned {
-        Err("This control is owned by the foreground app's Per-App Controls profile; edit that profile or leave the app".into())
-    } else {
-        Ok(())
+    if !owned {
+        return Ok(());
+    }
+    // `originals()` also carries recovery tokens, written when a daemon restart
+    // or a failed restore left a per-app override half applied. Those are not
+    // ownership: no foreground profile is holding the control, and nothing
+    // ever clears such a key. Gating on the map alone therefore locked users
+    // out of `SET perf` forever with a message naming an app that was not
+    // running. Only an applied foreground profile owns a global control.
+    let r = runtime().lock().map_err(|_| "per-app runtime lock poisoned")?;
+    match &r.owner.status {
+        Status::Active(_) => Err(
+            "This control is owned by the foreground app's Per-App Controls profile; edit that profile or leave the app"
+                .into(),
+        ),
+        // A restore is still pending and would overwrite a global write, so
+        // say so instead of blaming an app that is not in the foreground.
+        Status::RecoveryRequired(error) => {
+            Err(format!("Per-App Controls is still restoring this control: {error}"))
+        }
+        Status::Global => Ok(()),
     }
 }
 pub(super) fn release() -> Result<(), String> {
@@ -934,10 +955,25 @@ fn recover() -> Result<(), String> {
     let saved: BTreeMap<String, Saved> =
         serde_json::from_slice(&raw).map_err(|e| format!("per-app recovery journal: {e}"))?;
     *originals().lock().map_err(|_| "originals lock poisoned")? = saved.clone();
+    // Restore every control even when one of them fails. Aborting on the first
+    // error stranded the remaining tokens in `originals()`, and those keys are
+    // read as live ownership elsewhere, so a single failed restore could lock
+    // the module out of its own global controls for the rest of the session.
+    let mut errors = Vec::new();
     for (name, token) in saved {
-        Adapter::new().restore(&control(&name).ok_or("unknown recovery control")?, &token)?;
+        let Some(target) = control(&name) else {
+            errors.push(format!("{name}: unknown recovery control"));
+            continue;
+        };
+        if let Err(error) = Adapter::new().restore(&target, &token) {
+            errors.push(format!("{name}: {error}"));
+        }
     }
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("per-app recovery: {}", errors.join("; ")))
+    }
 }
 pub(super) fn start() {
     if STARTED.swap(true, Ordering::AcqRel) {
