@@ -8036,6 +8036,15 @@ class _CpuControlScreenState extends State<CpuControlScreen> {
   String _toastMessage = '';
   IconData _toastIcon = Icons.info_outline;
   Color _toastAccent = const Color(0xFF67C2FF);
+  int? _optimisticSconfig;
+
+  String get _sconfigSelectionLabel {
+    final int value =
+        _optimisticSconfig ?? DashBackend.instance.thermalConfigMode;
+    if (value < 0) return 'OEM';
+    if (value == 0) return 'Normal';
+    return 'Mode $value';
+  }
 
   @override
   void initState() {
@@ -8094,6 +8103,58 @@ class _CpuControlScreenState extends State<CpuControlScreen> {
       Icons.memory_rounded,
       accent,
     );
+  }
+
+  bool _applySconfig(int mode) {
+    final DashBackend backend = DashBackend.instance;
+    if (_optimisticSconfig != null || mode == backend.thermalConfigMode) {
+      return false;
+    }
+    setState(() => _optimisticSconfig = mode);
+    if (!backend.setThermalConfigMode(mode)) {
+      setState(() => _optimisticSconfig = null);
+      return false;
+    }
+    _showGlassToast(
+      'THERMAL MODE',
+      'Applied sconfig mode $mode',
+      Icons.thermostat_rounded,
+      const Color(0xFFFF8E3C),
+    );
+    Future<void>.delayed(const Duration(milliseconds: 500), () {
+      DashBackend.instance.refresh();
+      if (mounted) {
+        setState(() => _optimisticSconfig = null);
+      }
+    });
+    return true;
+  }
+
+  bool _resetSconfig() {
+    final DashBackend backend = DashBackend.instance;
+    if (_optimisticSconfig != null || backend.thermalConfigMode < 0) {
+      DashHaptics.reject();
+      return false;
+    }
+    if (!backend.resetThermalConfigMode()) {
+      DashHaptics.reject();
+      return false;
+    }
+    DashHaptics.confirm();
+    setState(() => _optimisticSconfig = -1);
+    _showGlassToast(
+      'THERMAL MODE',
+      'Thermal control released to OEM',
+      Icons.restart_alt_rounded,
+      const Color(0xFF67C2FF),
+    );
+    Future<void>.delayed(const Duration(milliseconds: 500), () {
+      DashBackend.instance.refresh();
+      if (mounted) {
+        setState(() => _optimisticSconfig = null);
+      }
+    });
+    return true;
   }
 
   @override
@@ -8344,6 +8405,53 @@ class _CpuControlScreenState extends State<CpuControlScreen> {
                     title: 'How to use CPU frequency control',
                     text:
                         'Choose Dynamic Range to set the minimum and maximum, or Exact Lock to make both limits the same. Drag to a supported clock and tap Apply. Live Limits always shows the range currently enforced by the kernel. Each card shows the current governor live; governor selection remains in Advanced Configuration. OEM Reset clears the saved target and returns that cluster to ROM-managed limits.',
+                  ),
+                ),
+                const SizedBox(height: 12),
+
+                // THERMAL CONFIG MODE (SCONFIG)
+                Text(
+                  'THERMAL CONFIG MODE',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: 0.6,
+                    color: colors.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(height: 9),
+                _ChoiceCard(
+                  title: 'MI thermal mode (sconfig)',
+                  subtitle:
+                      'mtd thermal profile selection · 0 = Normal · 6 = No Limits · '
+                      'Current: $_sconfigSelectionLabel',
+                  icon: Icons.thermostat_rounded,
+                  accent: const Color(0xFFFF8E3C),
+                  selectedCode: _optimisticSconfig ?? backend.thermalConfigMode,
+                  options: const <_ChoiceOption>[
+                    _ChoiceOption(0, 'Normal'),
+                    _ChoiceOption(1, 'Mode 1'),
+                    _ChoiceOption(2, 'Mode 2'),
+                    _ChoiceOption(3, 'Mode 3'),
+                    _ChoiceOption(4, 'Mode 4'),
+                    _ChoiceOption(5, 'Mode 5'),
+                    _ChoiceOption(6, 'No Limits'),
+                  ],
+                  enabled: canWrite && _optimisticSconfig == null,
+                  onSelected: _applySconfig,
+                ),
+                const SizedBox(height: 9),
+                SurfaceCard(
+                  child: Align(
+                    alignment: Alignment.centerRight,
+                    child: TextButton.icon(
+                      onPressed:
+                          canWrite && backend.thermalConfigMode >= 0
+                              ? _resetSconfig
+                              : null,
+                      icon: const Icon(Icons.restart_alt_rounded, size: 17),
+                      label: const Text('OEM Reset'),
+                    ),
                   ),
                 ),
                 const SizedBox(height: 12),

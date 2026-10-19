@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
+
 mod app_controls;
 mod app_runtime;
 mod bypass_policy;
@@ -1416,18 +1418,17 @@ fn validate_cpu_frequency_range_against(
         return Err("cpu minimum frequency exceeds maximum".into());
     }
 
-    if available.is_empty() {
-        return Err(format!("policy{policy} frequency table unavailable"));
-    }
-    if !available.contains(&min_mhz) {
-        return Err(format!(
-            "{min_mhz} MHz is not a supported policy{policy} frequency"
-        ));
-    }
-    if !available.contains(&max_mhz) {
-        return Err(format!(
-            "{max_mhz} MHz is not a supported policy{policy} frequency"
-        ));
+    if !available.is_empty() {
+        if !available.contains(&min_mhz) {
+            return Err(format!(
+                "{min_mhz} MHz is not a supported policy{policy} frequency"
+            ));
+        }
+        if !available.contains(&max_mhz) {
+            return Err(format!(
+                "{max_mhz} MHz is not a supported policy{policy} frequency"
+            ));
+        }
     }
 
     Ok(())
@@ -1511,6 +1512,52 @@ fn write_mi_thermal_config_mode(mode: i32) -> Result<(), String> {
         ));
     }
 
+    Ok(())
+}
+
+// MI thermal config mode (sconfig) is a user-facing hardware control. -1
+// means follow OEM/mi_thermald and do not override the live thermal policy.
+fn apply_thermal_mode(mode: i32) -> Result<(), String> {
+    if !valid_mi_thermal_config_mode(mode) {
+        return Err(format!("invalid MI thermal config mode {mode}"));
+    }
+    write_mi_thermal_config_mode(mode)?;
+    mutate_persisted_state(|state| state.thermal_mode = mode)?;
+    Ok(())
+}
+
+fn reset_thermal_mode() -> Result<(), String> {
+    mutate_persisted_state(|state| state.thermal_mode = -1)?;
+    // Hand the thermal configuration back to mi_thermald immediately by
+    // restoring the journaled value, mirroring the disable path. Without
+    // this the last override would stick until mi_thermald's next rewrite.
+    if let Some(value) = service_control::original(MI_THERMAL_SCONFIG)
+        .as_ref()
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    {
+        ::std::fs::write(MI_THERMAL_SCONFIG, &value)
+            .map_err(|error| format!("MI thermal config restore write: {error}"))?;
+        let actual = read_trimmed(MI_THERMAL_SCONFIG)
+            .map_err(|e| format!("MI thermal config restore readback: {e}"))?;
+        if actual.trim() != value.trim() {
+            return Err(format!(
+                "MI thermal config restore requested {value}, live {actual}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn restore_saved_thermal_mode() -> Result<(), String> {
+    let mode = persisted_state()
+        .lock()
+        .ok()
+        .map(|state| state.thermal_mode)
+        .unwrap_or(-1);
+    if mode >= 0 {
+        apply_thermal_mode(mode)?;
+    }
     Ok(())
 }
 
@@ -3067,6 +3114,7 @@ struct PersistedState {
     cpu_min_freq7: i32,
     cpu_max_freq7: i32,
     cpu_thermal_mode_prev: i32,
+    thermal_mode: i32,
 }
 
 impl Default for PersistedState {
@@ -3113,6 +3161,7 @@ impl Default for PersistedState {
             cpu_min_freq7: -1,
             cpu_max_freq7: -1,
             cpu_thermal_mode_prev: -1,
+            thermal_mode: -1,
         }
     }
 }
@@ -3460,6 +3509,15 @@ fn parse_persisted_state(raw: &str) -> PersistedState {
                     };
                 }
             }
+            "thermal_mode" => {
+                if let Some(v) = int_value() {
+                    state.thermal_mode = if valid_mi_thermal_config_mode(v) {
+                        v
+                    } else {
+                        -1
+                    };
+                }
+            }
             _ => {}
         }
     }
@@ -3561,6 +3619,7 @@ fn save_persisted_state(state: &PersistedState) -> Result<(), String> {
         "cpu_thermal_mode_prev={}\n",
         state.cpu_thermal_mode_prev
     ));
+    out.push_str(&format!("thermal_mode={}\n", state.thermal_mode));
 
     let state_file = state_file();
     let tmp = state_dir.join("state.conf.tmp");
@@ -4558,6 +4617,10 @@ fn restore_persisted_state() {
         CPU_FREQ_WRITE_ACK.store(0, Ordering::Release);
     }
 
+    // Apply a user-selected MI thermal config mode (sconfig) if one was saved.
+    // -1 means follow OEM/mi_thermald and do not override on boot.
+    let _ = restore_saved_thermal_mode();
+
     if state.gpu_uncap == 1 {
         let _ = set_gpu_uncap(true);
     } else {
@@ -4764,6 +4827,17 @@ fn cpu_frequency_guard() {
                 && restore_cpu_thermal_mode_unlocked().is_err()
             {
                 CPU_THERMAL_MODE_ACK.store(0, Ordering::Release);
+            }
+
+            // mi_thermald may overwrite a user-selected sconfig mode at
+            // runtime. Reassert only on real drift and only while no custom
+            // CPU range owns the thermal configuration.
+            if !has_saved_range
+                && state.thermal_mode >= 0
+                && let Ok(current) = read_mi_thermal_config_mode()
+                && current != state.thermal_mode
+            {
+                let _ = apply_thermal_mode(state.thermal_mode);
             }
 
             has_saved_range
@@ -6248,6 +6322,7 @@ fn snapshot_persistence_fields() -> Vec<String> {
         format!("cpu_thermal_mode={cpu_thermal_mode}"),
         format!("cpu_thermal_mode_prev={}", state.cpu_thermal_mode_prev),
         format!("cpu_thermal_unrestricted={cpu_thermal_unrestricted}"),
+        format!("thermal_mode={}", state.thermal_mode),
         format!(
             "cpu_thermal_mode_ack={}",
             CPU_THERMAL_MODE_ACK.load(Ordering::Acquire)
@@ -7019,6 +7094,15 @@ fn handle_enabled_command(line: &str) -> String {
             Err(error) => format!("ERR {error}"),
         };
     }
+    if cmd == "GET thermal.sconfig" {
+        let mode = read_mi_thermal_config_mode().unwrap_or(-1);
+        let saved = persisted_state()
+            .lock()
+            .ok()
+            .map(|s| s.thermal_mode)
+            .unwrap_or(-1);
+        return format!("OK {{\"sconfig\":{mode},\"saved\":{saved}}}");
+    }
     if let Some(args) = cmd.strip_prefix("SET system.colors.contrast ") {
         return match system_colors::apply_contrast(args) {
             Ok(state) => format!("OK {state}"),
@@ -7254,6 +7338,13 @@ fn handle_enabled_command(line: &str) -> String {
             .and_then(|v| set_gpu_uncap(v == 1))
     } else if cmd == "ACTION gpu.uncap_full_speed" {
         set_gpu_uncap(true)
+    } else if let Some(arg) = cmd.strip_prefix("SET thermal.sconfig ") {
+        match arg.trim().parse::<i32>() {
+            Ok(mode) => apply_thermal_mode(mode),
+            Err(_) => Err("invalid thermal mode".to_string()),
+        }
+    } else if cmd == "ACTION thermal.sconfig.reset" {
+        reset_thermal_mode()
     } else {
         return "ERR unknown command".into();
     };
@@ -7933,6 +8024,25 @@ posdiv: 0, margin:     0, power:     0\n";
             ..PersistedState::default()
         };
         assert!(persisted_cpu_ranges_active(&exact));
+    }
+
+    #[test]
+    fn persists_valid_thermal_mode_and_rejects_invalid() {
+        // A saved sconfig round-trips through the state serialization; an out
+        // of range value degrades to -1 (follow OEM) instead of being reused.
+        assert_eq!(
+            super::parse_persisted_state(&format!("thermal_mode={MI_THERMAL_NO_LIMITS_MODE}"))
+                .thermal_mode,
+            MI_THERMAL_NO_LIMITS_MODE
+        );
+
+        for raw in [
+            "thermal_mode=0x801\n",
+            "thermal_mode=-2\n",
+            "thermal_mode=abc\n",
+        ] {
+            assert_eq!(super::parse_persisted_state(raw).thermal_mode, -1);
+        }
     }
 
     #[test]

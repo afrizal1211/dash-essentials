@@ -827,6 +827,15 @@ final class DashBackend {
   bool setGpuPowerPolicy(int policyCode) =>
       setExtendedOperation(22, policyCode);
 
+  int get thermalConfigMode => extendedValue(19);
+
+  bool setThermalConfigMode(int mode) {
+    if (mode < 0 || mode > 0x800) return false;
+    return setExtendedOperation(32, mode);
+  }
+
+  bool resetThermalConfigMode() => setExtendedOperation(33, 0);
+
   int photoPermissionState() {
     if (!_started) return 0;
     return _photoPermissionStateNative();

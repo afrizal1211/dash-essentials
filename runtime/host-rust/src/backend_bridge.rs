@@ -772,6 +772,7 @@ fn refresh(cache: &Cache) -> Result<(), String> {
         ("cpu_drift7", 16),
         ("gpu_drift", 17),
         ("io_drift", 18),
+        ("thermal_mode", 19),
         ("display_width", 22),
         ("display_height", 23),
         ("display_hz_x10", 24),
@@ -1141,6 +1142,15 @@ fn perform(command: Command) -> Result<(), String> {
                 31 if matches!(a, 0 | 20 | 40 | 80 | 90) => {
                     format!("SET charging.bypass_threshold {a}")
                 }
+                // MI thermal config mode (sconfig). Mode range matches the
+                // daemon-side validator; the next snapshot reconciles drift.
+                32 if (0..=0x800).contains(&a) => {
+                    if let Some(r) = runtime() {
+                        r.cache.extended[19].store(a, Ordering::Release);
+                    }
+                    return request(&format!("SET thermal.sconfig {a}")).map(|_| ());
+                }
+                33 => "ACTION thermal.sconfig.reset".to_string(),
                 _ => return Err("invalid extended command".into()),
             };
 

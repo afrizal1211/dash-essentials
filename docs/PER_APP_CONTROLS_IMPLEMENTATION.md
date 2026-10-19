@@ -40,7 +40,10 @@ Essential takes priority over every profile.
 - Versioned, bounded profile configuration and private atomic file replacement.
 - Strict package/user identity, input and field validation.
 - Capability validation against detected CPU frequency/governor tables and
-  supported touch/GPU/refresh modes. No guessed CPU frequencies.
+  supported touch/GPU/refresh modes. No guessed CPU frequencies. A cluster
+  booted with its core offline advertises no frequency table; its range is
+  then still accepted and validated by the live sysfs apply path instead of
+  being rejected before it can be applied.
 - Independent CPU range, governor and core targets.
 - Resumed-app event parsing for Android/vendor event-log formats.
 - Ownership transitions that capture originals before writing, deduplicate

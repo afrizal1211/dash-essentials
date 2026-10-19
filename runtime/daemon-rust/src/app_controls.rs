@@ -99,10 +99,15 @@ impl Capabilities {
                 (Control::Gpu, Target::Gpu(value)) => self.gpu.contains(value),
                 (Control::CpuRange(policy), Target::CpuRange { min, max }) => {
                     min <= max
-                        && self
-                            .cpu_frequencies
-                            .get(policy)
-                            .is_some_and(|table| table.contains(min) && table.contains(max))
+                        && match self.cpu_frequencies.get(policy) {
+                            Some(table) if !table.is_empty() => {
+                                table.contains(min) && table.contains(max)
+                            }
+                            // Core offline or frequency table unavailable: the
+                            // range is accepted here; the apply path validates
+                            // against live sysfs and rolls back on failure.
+                            _ => true,
+                        }
                 }
                 (Control::CpuGovernor(policy), Target::CpuGovernor(value)) => self
                     .cpu_governors
@@ -587,6 +592,17 @@ mod tests {
             caps.validate(&Profile::parse(&json!({"refresh":120})).unwrap())
                 .is_err()
         );
+    }
+    #[test]
+    fn offline_cpu_policy_range_is_accepted_not_guessed() {
+        // A core that is offline advertises no frequency table. The per-app
+        // range must still be accepted; the apply path validates live sysfs.
+        let mut caps = Capabilities::default();
+        caps.cpu_frequencies.insert(7, BTreeSet::new());
+        let p = Profile::parse(&json!({"cpu":{"7":{"range":[798,3730]}}})).unwrap();
+        assert!(caps.validate(&p).is_ok());
+        // Inversion is rejected at parse, before capability validation.
+        assert!(Profile::parse(&json!({"cpu":{"7":{"range":[3730,798]}}})).is_err());
     }
     #[test]
     fn repeated_foreground_events_do_not_rewrite_hardware() {

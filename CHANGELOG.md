@@ -48,6 +48,19 @@ original wording.
   source repository.
 - The upstream Flutter embedder engine release `v1.18.5` (Flutter 3.44.8) is
   pinned as the Dart/AOT runtime by `tools/fetch-flutter-engine-prebuilt.sh`.
+- Per-app CPU ranges apply even when a cluster is booted with its core
+  offline. The capability check no longer rejects `CpuRange(policy)` just
+  because the online kernel exposes no frequency table for that policy; the
+  range is validated by the live apply path, which verifies writes and rolls
+  back on failure.
+- The MI thermal config mode (sconfig) is directly controllable. New daemon
+  commands `SET thermal.sconfig <mode>`, `ACTION thermal.sconfig.reset` and
+  `GET thermal.sconfig`, a persisted consumer choice (`thermal_mode`, -1 =
+  follow mi_thermald) that survives reboots and control enable/disable, and
+  drift reassertion by the CPU frequency guard while no custom CPU range owns
+  the thermal configuration. Reset and disable restore the journaled OEM
+  value. The host bridge exposes the live mode and the app CPU screen gains a
+  mode selector with OEM Reset.
 
 
 ## 1.18.6
