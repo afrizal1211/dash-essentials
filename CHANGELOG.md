@@ -39,6 +39,10 @@ original wording.
   `libtouchreport_hal.so` does not carry the upstream timing block, so a missing
   block is reported and skipped instead of aborting the whole touch apply; the
   vendor touch HAL path stays authoritative.
+- The settings audit reports a GPU performance profile only when the platform
+  actually refused it. The readback compared the acceptance instead of its
+  absence, so a profile that was in force was logged as `not in force` while a
+  profile that really had failed was reported only by the apply error.
 - Application links point at `https://github.com/afrizal1211/dash-essentials`,
   the `POCOX8ProMaxID` Telegram community, and the upstream Rodin Essential
   source repository.

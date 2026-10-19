@@ -6873,7 +6873,11 @@ fn settings_readback_mismatch(cmd: &str) -> Option<String> {
     match name {
         "perf" => {
             let profile = arg.parse::<i32>().ok()?;
-            gpu_profile_accepted(profile).then(|| {
+            // Report only a profile the platform refused. `bool::then` yields
+            // `Some` for a true condition, so the acceptance test has to be
+            // negated: the previous form logged "not in force" for every
+            // profile that *was* in force and stayed silent when it was not.
+            (!gpu_profile_accepted(profile)).then(|| {
                 format!(
                     "gpu profile {profile} not in force: governor={} dvfs={} power_policy={}",
                     gpu_get_governor(),
@@ -7418,7 +7422,8 @@ mod tests {
         MI_THERMAL_NO_LIMITS_MODE, PersistedState, charging_profile_fcc_ua,
         classify_touch_panel_version, client_uid_allowed, command_key,
         cpu_frequency_drift_status,
-        find_touch_thp_config_offset, gaming_dynamic_target_opp, mi_thermal_cpu_limit_request,
+        find_touch_thp_config_offset, gaming_dynamic_target_opp, gpu_profile_accepted,
+        mi_thermal_cpu_limit_request,
         migrate_legacy_gpu_profile_cpu_state, mtk_powerhal_cpu_range_request,
         normalize_charging_profile, normalize_mi_thermal_config_mode, normalize_reported_power_w,
         opp_index_for_freq_mhz, opp_index_stepped_by_levels, package_app_id_from_packages_list,
@@ -7806,6 +7811,30 @@ posdiv: 0, margin:     0, power:     0\n";
         assert!(settings_readback_mismatch("SET perf not-a-number").is_none());
         assert!(settings_readback_mismatch("SET gpu.min_freq 5x").is_none());
         assert!(settings_readback_mismatch("ACTION gpu.uncap_full_speed").is_none());
+    }
+
+    #[test]
+    fn perf_readback_reports_a_profile_that_is_not_in_force() {
+        // The audit must be the mirror of `gpu_profile_accepted`: a profile
+        // the platform accepted produces no problem, and one it refused
+        // produces exactly the "not in force" detail. Reporting the
+        // acceptance itself inverted every verdict, so the diagnostics log
+        // claimed working GPU profiles were missing and said nothing about
+        // the ones that really were.
+        for profile in 0..=3 {
+            let mismatch = settings_readback_mismatch(&format!("SET perf {profile}"));
+            assert_eq!(
+                mismatch.is_some(),
+                !gpu_profile_accepted(profile),
+                "profile {profile} verdict must be the negation of its acceptance"
+            );
+            if let Some(detail) = mismatch {
+                assert!(
+                    detail.contains(&format!("gpu profile {profile} not in force")),
+                    "unexpected detail for profile {profile}: {detail}"
+                );
+            }
+        }
     }
 
     #[test]
