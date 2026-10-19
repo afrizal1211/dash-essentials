@@ -757,12 +757,11 @@ fn maintain_bypass_policy() {
         .lock()
         .expect("bypass transaction poisoned");
     let state = persisted_state().lock().ok().map(|state| state.clone());
-    if let Some(state) = state.filter(|state| state.bypass_charging == 1) {
-        if let Err(error) = reconcile_bypass(true, state.bypass_threshold, false) {
-            if BYPASS_POLICY_ERROR.swap(1, Ordering::AcqRel) == 0 {
-                eprintln!("DASH_BYPASS_POLICY_FAIL {error}");
-            }
-        }
+    if let Some(state) = state.filter(|state| state.bypass_charging == 1)
+        && let Err(error) = reconcile_bypass(true, state.bypass_threshold, false)
+        && BYPASS_POLICY_ERROR.swap(1, Ordering::AcqRel) == 0
+    {
+        eprintln!("DASH_BYPASS_POLICY_FAIL {error}");
     }
 }
 
@@ -3220,11 +3219,13 @@ fn load_persisted_state() -> PersistedState {
 }
 
 fn parse_persisted_state(raw: &str) -> PersistedState {
-    let mut state = PersistedState::default();
-
-    // State written before GPU/CPU profile isolation did not carry this key.
-    // Mark an existing file as legacy until the parser finds the new marker.
-    state.gpu_profile_cpu_isolated = 0;
+    let mut state = PersistedState {
+        // State written before GPU/CPU profile isolation did not carry this
+        // key. Mark an existing file as legacy until the parser finds the new
+        // marker.
+        gpu_profile_cpu_isolated: 0,
+        ..PersistedState::default()
+    };
 
     for line in raw.lines() {
         let line = line.trim();
@@ -3475,16 +3476,16 @@ fn parse_persisted_state(raw: &str) -> PersistedState {
     if !matches!(state.display_temp, -1 | 1..=3) {
         state.display_temp = -1;
     }
-    if !matches!(state.sunlight, -1 | 0 | 1) {
+    if !matches!(state.sunlight, -1..=1) {
         state.sunlight = -1;
     }
-    if !matches!(state.silky, -1 | 0 | 1) {
+    if !matches!(state.silky, -1..=1) {
         state.silky = -1;
     }
-    if !matches!(state.video, -1 | 0 | 1) {
+    if !matches!(state.video, -1..=1) {
         state.video = -1;
     }
-    if !matches!(state.dolby, -1 | 0 | 1) {
+    if !matches!(state.dolby, -1..=1) {
         state.dolby = -1;
     }
 
@@ -4373,14 +4374,14 @@ fn restore_persisted_state() {
         wake_bypass_monitor();
     }
 
-    if (1..=3).contains(&state.touch) {
-        if let Ok(_guard) = touch_profile_apply_lock().lock() {
-            let owned = persisted_state()
-                .lock()
-                .is_ok_and(|s| s.touch == state.touch);
-            if owned {
-                let _ = apply_touch_profile_locked(state.touch);
-            }
+    if (1..=3).contains(&state.touch)
+        && let Ok(_guard) = touch_profile_apply_lock().lock()
+    {
+        let owned = persisted_state()
+            .lock()
+            .is_ok_and(|s| s.touch == state.touch);
+        if owned {
+            let _ = apply_touch_profile_locked(state.touch);
         }
     }
 
@@ -5092,10 +5093,11 @@ pub fn start_background_services() {
     std::thread::spawn(charging_power_supply_event_loop);
     std::thread::spawn(|| {
         let _gate = service_control::GATE.read().expect("service gate poisoned");
-        if service_control::release_pending() && !service_control::enabled() {
-            if restore_released_controls().is_ok() {
-                let _ = service_control::set_release_pending(false);
-            }
+        if service_control::release_pending()
+            && !service_control::enabled()
+            && restore_released_controls().is_ok()
+        {
+            let _ = service_control::set_release_pending(false);
         }
         restore_persisted_state();
     });
@@ -6181,7 +6183,10 @@ fn snapshot_persistence_fields() -> Vec<String> {
         ),
         format!("display_ack={}", DISPLAY_APPLY_ACK.load(Ordering::Acquire)),
         format!("touch_ack={}", TOUCH_APPLY_ACK.load(Ordering::Acquire)),
-        format!("touch_error_code={}", TOUCH_ERROR_CODE.load(Ordering::Acquire)),
+        format!(
+            "touch_error_code={}",
+            TOUCH_ERROR_CODE.load(Ordering::Acquire)
+        ),
         format!("touch_error={}", snapshot_safe_text(&touch_error_text())),
         format!("cpu_manual={}", state.cpu_manual),
         format!("cpu_saved_mask={}", state.cpu_online_mask | 0x01),
@@ -6610,29 +6615,26 @@ fn restore_released_controls() -> Result<(), String> {
     // Open the range before restoring either end. A prior exact lock can
     // reject the original minimum when it lies above the current maximum.
     for (path, value) in service_control::originals() {
-        if path.ends_with("/scaling_min_freq")
-            || (path.contains("/devfreq/") && path.ends_with("/min_freq"))
+        if (path.ends_with("/scaling_min_freq")
+            || (path.contains("/devfreq/") && path.ends_with("/min_freq")))
+            && let Some(value) = value.as_str()
         {
-            if let Some(value) = value.as_str() {
-                let max_path = if path.ends_with("/scaling_min_freq") {
-                    path.replace("/scaling_min_freq", "/scaling_max_freq")
-                } else {
-                    path.replace("/min_freq", "/max_freq")
-                };
-                if let (Ok(minimum), Ok(maximum)) = (
-                    value.trim().parse::<i64>(),
-                    read_trimmed(&max_path)
-                        .and_then(|v| v.parse::<i64>().map_err(|e| e.to_string())),
-                ) {
-                    if minimum > maximum {
-                        run(
-                            &max_path,
-                            fs::write(&max_path, minimum.to_string()).map_err(|e| e.to_string()),
-                        );
-                    }
-                }
-                run(&path, fs::write(&path, value).map_err(|e| e.to_string()));
+            let max_path = if path.ends_with("/scaling_min_freq") {
+                path.replace("/scaling_min_freq", "/scaling_max_freq")
+            } else {
+                path.replace("/min_freq", "/max_freq")
+            };
+            if let (Ok(minimum), Ok(maximum)) = (
+                value.trim().parse::<i64>(),
+                read_trimmed(&max_path).and_then(|v| v.parse::<i64>().map_err(|e| e.to_string())),
+            ) && minimum > maximum
+            {
+                run(
+                    &max_path,
+                    fs::write(&max_path, minimum.to_string()).map_err(|e| e.to_string()),
+                );
             }
+            run(&path, fs::write(&path, value).map_err(|e| e.to_string()));
         }
     }
     let mut original_nodes = service_control::originals();
@@ -6980,10 +6982,10 @@ fn dispatch_command(cmd: &str) -> String {
         if let Err(error) = capture_feature_original(cmd) {
             return format!("ERR {error}");
         }
-        if !service_control::configured() {
-            if let Err(error) = service_control::set_intent(true, true) {
-                return format!("ERR {error}");
-            }
+        if !service_control::configured()
+            && let Err(error) = service_control::set_intent(true, true)
+        {
+            return format!("ERR {error}");
         }
     }
     handle_enabled_command(cmd)
@@ -7420,19 +7422,17 @@ mod tests {
     use super::{
         AppUidPolicy, FreqBound, GPU_BATTERY_CEILING_MHZ, GPU_MIN_FREQ_MHZ,
         MI_THERMAL_NO_LIMITS_MODE, PersistedState, charging_profile_fcc_ua,
-        classify_touch_panel_version, client_uid_allowed, command_key,
-        cpu_frequency_drift_status,
+        classify_touch_panel_version, client_uid_allowed, command_key, cpu_frequency_drift_status,
         find_touch_thp_config_offset, gaming_dynamic_target_opp, gpu_profile_accepted,
-        mi_thermal_cpu_limit_request,
-        migrate_legacy_gpu_profile_cpu_state, mtk_powerhal_cpu_range_request,
-        normalize_charging_profile, normalize_mi_thermal_config_mode, normalize_reported_power_w,
-        opp_index_for_freq_mhz, opp_index_stepped_by_levels, package_app_id_from_packages_list,
-        parse_cpu_frequency_table, parse_cpu_time_in_state, parse_ged_current_frequency_mhz,
-        parse_gpufreq_opp_table, persisted_cpu_ranges_active, profile_uses_ged_boost,
-        scaled_display_density, settings_readback_mismatch, snapshot_safe_text,
-        tcp_client_uid_from_table,
-        touch_error_code_for, touch_hal_profile_sequence,
-        valid_charging_profile, valid_mi_thermal_config_mode, validate_cpu_frequency_range_against,
+        mi_thermal_cpu_limit_request, migrate_legacy_gpu_profile_cpu_state,
+        mtk_powerhal_cpu_range_request, normalize_charging_profile,
+        normalize_mi_thermal_config_mode, normalize_reported_power_w, opp_index_for_freq_mhz,
+        opp_index_stepped_by_levels, package_app_id_from_packages_list, parse_cpu_frequency_table,
+        parse_cpu_time_in_state, parse_ged_current_frequency_mhz, parse_gpufreq_opp_table,
+        persisted_cpu_ranges_active, profile_uses_ged_boost, scaled_display_density,
+        settings_readback_mismatch, snapshot_safe_text, tcp_client_uid_from_table,
+        touch_error_code_for, touch_hal_profile_sequence, valid_charging_profile,
+        valid_mi_thermal_config_mode, validate_cpu_frequency_range_against,
     };
 
     fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
@@ -7767,7 +7767,10 @@ posdiv: 0, margin:     0, power:     0\n";
         assert_eq!(touch_error_code_for("touch HAL rejected required modes"), 4);
         assert_eq!(touch_error_code_for("THP runtime verify failed"), 3);
         assert_eq!(touch_error_code_for("THP timing block not found"), 2);
-        assert_eq!(touch_error_code_for("libtouchreport_hal.so is not mapped"), 2);
+        assert_eq!(
+            touch_error_code_for("libtouchreport_hal.so is not mapped"),
+            2
+        );
         assert_eq!(touch_error_code_for("TouchFeature HAL unavailable"), 1);
         // The panel wording changed but the error code must not: the app maps
         // its labels from the code, not from the message text.
@@ -7795,7 +7798,10 @@ posdiv: 0, margin:     0, power:     0\n";
     #[test]
     fn settings_audit_names_the_command_without_its_argument() {
         assert_eq!(command_key("SET perf 2"), "SET perf");
-        assert_eq!(command_key("SET gpu.governor performance"), "SET gpu.governor");
+        assert_eq!(
+            command_key("SET gpu.governor performance"),
+            "SET gpu.governor"
+        );
         assert_eq!(
             command_key("ACTION gpu.uncap_full_speed"),
             "ACTION gpu.uncap_full_speed"

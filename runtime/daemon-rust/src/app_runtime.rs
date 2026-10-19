@@ -561,7 +561,10 @@ fn refresh_setting(
     value: Option<&str>,
 ) -> Result<String, String> {
     if !matches!(table, "system" | "secure")
-        || !matches!(key, "user_refresh_rate" | "miui_refresh_rate" | "is_smart_fps")
+        || !matches!(
+            key,
+            "user_refresh_rate" | "miui_refresh_rate" | "is_smart_fps"
+        )
     {
         return Err("invalid ROM refresh setting".into());
     }
@@ -586,7 +589,10 @@ fn capture_vendor_refresh(user: u32) -> Result<Value, String> {
             }
         }
     }
-    if entries.iter().any(|entry| entry["key"] == "miui_refresh_rate") {
+    if entries
+        .iter()
+        .any(|entry| entry["key"] == "miui_refresh_rate")
+    {
         let value = refresh_setting(user, "system", "get", "is_smart_fps", None)?;
         if matches!(value.as_str(), "0" | "1") {
             entries.push(json!({"table":"system","key":"is_smart_fps","value":value}));
@@ -657,10 +663,10 @@ fn foreground() -> Result<Option<App>, String> {
     parse_foreground(&raw)
 }
 fn parse_foreground(raw: &str) -> Result<Option<App>, String> {
-    if raw
-        .lines()
-        .any(|line| line.split_whitespace().any(|token| matches!(token, "mSleeping=true" | "mShuttingDown=true")))
-    {
+    if raw.lines().any(|line| {
+        line.split_whitespace()
+            .any(|token| matches!(token, "mSleeping=true" | "mShuttingDown=true"))
+    }) {
         return Ok(None);
     }
     let top: Vec<_> = raw
@@ -898,7 +904,9 @@ pub(super) fn check_global_command(cmd: &str) -> Result<(), String> {
     // ever clears such a key. Gating on the map alone therefore locked users
     // out of `SET perf` forever with a message naming an app that was not
     // running. Only an applied foreground profile owns a global control.
-    let r = runtime().lock().map_err(|_| "per-app runtime lock poisoned")?;
+    let r = runtime()
+        .lock()
+        .map_err(|_| "per-app runtime lock poisoned")?;
     match &r.owner.status {
         Status::Active(_) => Err(
             "This control is owned by the foreground app's Per-App Controls profile; edit that profile or leave the app"
@@ -1007,11 +1015,9 @@ pub(super) fn start() {
             // Vendor events may precede the authoritative focused summary.
             // Bounded read-only settling checks, not a permanent polling loop.
             for delay in [0, 150, 350] {
-                if delay > 0 {
-                    if receiver.recv_timeout(Duration::from_millis(delay)).is_ok() {
-                        // A newer event supersedes the pending settling check.
-                        while receiver.try_recv().is_ok() {}
-                    }
+                if delay > 0 && receiver.recv_timeout(Duration::from_millis(delay)).is_ok() {
+                    // A newer event supersedes the pending settling check.
+                    while receiver.try_recv().is_ok() {}
                 }
                 let _gate = service_control::GATE.write().expect("service gate");
                 if let Ok(mut r) = runtime().lock() {
@@ -1139,9 +1145,11 @@ mod tests {
     }
     #[test]
     fn gpu_baseline_copy_does_not_touch_cpu_or_touch() {
-        let mut global = PersistedState::default();
-        global.cpu_min_freq0 = 1000;
-        global.touch = 2;
+        let global = PersistedState {
+            cpu_min_freq0: 1000,
+            touch: 2,
+            ..PersistedState::default()
+        };
         let mut effective = global.clone();
         effective.perf = 3;
         effective.cpu_min_freq0 = 2100;
@@ -1153,8 +1161,10 @@ mod tests {
     }
     #[test]
     fn cpu_range_baseline_does_not_change_governor() {
-        let mut global = PersistedState::default();
-        global.cpu0 = "schedutil".into();
+        let global = PersistedState {
+            cpu0: "schedutil".into(),
+            ..PersistedState::default()
+        };
         let mut effective = global.clone();
         effective.cpu0 = "performance".into();
         copy_preference(&Control::CpuRange(0), &global, &mut effective);

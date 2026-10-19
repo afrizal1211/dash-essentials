@@ -751,8 +751,10 @@ mod tests {
     }
     #[test]
     fn resetting_current_profile_releases_all_borrowed_controls() {
-        let mut config = Config::default();
-        config.enabled = true;
+        let mut config = Config {
+            enabled: true,
+            ..Config::default()
+        };
         config.profiles.insert(app(), profile());
         let mut h = hardware();
         let original = h.values.clone();
@@ -830,10 +832,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "dash-profiles-test-{}-{nonce}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("dash-profiles-test-{}-{nonce}", std::process::id()));
         let path = dir.join("profiles.json");
         assert_eq!(Config::load(&path).unwrap(), Config::default());
         let mut config = Config::default();

@@ -4,6 +4,9 @@ pub fn valid_threshold(value: i32) -> bool {
     matches!(value, 0 | 20 | 40 | 80 | 90)
 }
 
+// A pure decision table: every argument is one independently read sysfs or
+// HAL signal, so grouping them into a struct would only rename the inputs.
+#[allow(clippy::too_many_arguments)]
 pub fn phase(
     enabled: bool,
     threshold: i32,
