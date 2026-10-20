@@ -12479,6 +12479,7 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
   int? _optimisticGov;
   bool? _optimisticGedBoost;
   int? _optimisticPowerPolicy;
+  bool? _optimisticThermalUnlock;
   Timer? _interactionTimer;
 
   // Glass Frosted HUD Toast State
@@ -12627,6 +12628,28 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
     });
   }
 
+  void _toggleThermalUnlock(bool enabled) {
+    DashHaptics.confirm();
+    setState(() => _optimisticThermalUnlock = enabled);
+
+    _showGlassToast(
+      'THERMAL CEILING',
+      enabled
+          ? 'Raised MTK GPU ceiling · AP safety cap stays on'
+          : 'Restored MTK stock GPU ceiling',
+      enabled ? Icons.lock_open_rounded : Icons.lock_rounded,
+      enabled ? const Color(0xFFFFB84D) : const Color(0xFF67C2FF),
+    );
+
+    DashBackend.instance.setGpuThermalUnlock(enabled);
+    Future<void>.delayed(const Duration(milliseconds: 500), () {
+      DashBackend.instance.refresh();
+      if (mounted) {
+        setState(() => _optimisticThermalUnlock = null);
+      }
+    });
+  }
+
   void _resetDefault() {
     DashHaptics.confirm();
     setState(() {
@@ -12637,6 +12660,7 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
       _optimisticGov = 4;
       _optimisticGedBoost = false;
       _optimisticPowerPolicy = 0;
+      _optimisticThermalUnlock = null;
     });
 
     _showGlassToast(
@@ -12728,6 +12752,13 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
             activePerf == 3 ||
             isUncapped ||
             (activeMinFreq == 1612 && activeMaxFreq == 1612);
+        final bool thermalUnlock =
+            _optimisticThermalUnlock ?? backend.gpuThermalUnlock;
+        final bool showThermalCapNotice =
+            _optimisticProfile == null &&
+            backend.gpuThermallyCapped &&
+            !thermalUnlock &&
+            (isBeast || backend.gpuThermalCeiling > 0);
         final bool isGaming = !isBeast && activePerf == 1;
         final bool isBattery = !isBeast && activePerf == 2;
         final Color mainColor = isBeast
@@ -12817,6 +12848,15 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
                       snapshot.performanceProfile < 0 &&
                       _optimisticProfile == null,
                 ),
+                if (showThermalCapNotice) ...<Widget>[
+                  const SizedBox(height: 12),
+                  _buildThermalCapNotice(
+                    isDark: isDark,
+                    colors: colors,
+                    ceilingMhz: backend.gpuThermalCeiling,
+                    onUnlock: () => _toggleThermalUnlock(true),
+                  ),
+                ],
                 const SizedBox(height: 12),
 
                 // 2. QUICK GPU PRESETS (4 TILES)
@@ -12865,6 +12905,83 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
           ],
         );
       },
+    );
+  }
+
+  // THERMAL CEILING NOTICE: the MTK thermal framework clamps the GPU below the
+  // Beast target on this SoC (stock THERMAL_EB ceiling is 1430 MHz). Surface it
+  // honestly and offer the opt-in unlock instead of pretending 1612 is live.
+  Widget _buildThermalCapNotice({
+    required bool isDark,
+    required ColorScheme colors,
+    required int ceilingMhz,
+    required VoidCallback onUnlock,
+  }) {
+    const Color accent = Color(0xFFFFB84D);
+    final String ceiling = ceilingMhz > 0 ? '$ceilingMhz MHz' : 'below 1612 MHz';
+    return SurfaceCard(
+      accent: accent,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              const Icon(Icons.thermostat_rounded, size: 18, color: accent),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Thermally capped at $ceiling',
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w800,
+                    color: colors.onSurface,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            "MediaTek's thermal firmware is holding the Mali ceiling below "
+            'Extreme Beast\'s 1.61 GHz target. The AP safety cap stays armed; '
+            'only the stock 1430 MHz ceiling is lifted. Use only with active '
+            'cooling.',
+            style: TextStyle(fontSize: 12.5, color: colors.onSurfaceVariant),
+          ),
+          const SizedBox(height: 10),
+          Align(
+            alignment: Alignment.centerRight,
+            child: PressScale(
+              onTap: onUnlock,
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 8,
+                ),
+                decoration: BoxDecoration(
+                  color: accent.withValues(alpha: 0.16),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    Icon(Icons.lock_open_rounded, size: 15, color: accent),
+                    SizedBox(width: 6),
+                    Text(
+                      'Unlock ceiling',
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w800,
+                        color: accent,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 

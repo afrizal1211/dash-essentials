@@ -106,6 +106,32 @@ original wording.
   alongside the zip and APK so the updater never has to trust a bare
   download.
 
+## 1.18.10
+
+Codename: Tsuki.
+
+- Per-app GPU controls no longer follow or rewrite the global profile. A per-app
+  GPU choice was applied through the global `SET perf` path, which persisted it
+  as the user's global profile: a stock global profile dragged an app's gaming
+  clocks back down, and changing the global profile rewrote every app. Per-app
+  GPU now drives the hardware through a dedicated path that never touches the
+  persisted global choice and holds the background drift guard off the Mali
+  nodes while the override is in force.
+- Extreme Beast now reaches the 1612 MHz OPP instead of settling at 1430. The
+  DVFS freeze previously waited for the live clock to read 1612 first, but an
+  idle GPU power-collapses below its floor and the load governor's steady state
+  sits on the 1430 MHz plateau, so the lock never armed. Beast now locks once
+  the 1612 MHz floor is in force (devfreq floor or GED floor index 0), which the
+  guard re-asserts every 100 ms.
+- Extreme Beast reports a thermal clamp honestly. On this SoC the MediaTek
+  thermal firmware holds a stock 1430 MHz GPU ceiling (`THERMAL_EB`) that no GED
+  or devfreq write can beat; Dash now reads the live thermal ceiling and PPM
+  limiter, logs `beast thermally capped` with the exact node state, and shows a
+  "thermally capped" notice instead of implying 1612 is live.
+- New opt-in "unlock ceiling" control raises the stock 1430 MHz GPU ceiling when
+  the user chooses to, while the AP thermal safety cap stays armed. It is off by
+  default and reverts cleanly.
+
 ## 1.18.9
 
 Codename: Hoshi.

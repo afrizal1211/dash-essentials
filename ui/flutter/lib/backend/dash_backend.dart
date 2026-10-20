@@ -827,6 +827,21 @@ final class DashBackend {
   bool setGpuPowerPolicy(int policyCode) =>
       setExtendedOperation(22, policyCode);
 
+  /// Live MTK thermal GPU ceiling in MHz as reported by
+  /// `/sys/kernel/thermal/gpu_info`; -1 when unavailable.
+  int get gpuThermalCeiling => extendedValue(122);
+
+  /// 1 when the MTK thermal framework is holding the GPU below Beast's
+  /// 1612 MHz target. Drives the "thermally capped" notice.
+  bool get gpuThermallyCapped => extendedValue(123) == 1;
+
+  /// Opt-in state of the THERMAL_EB ceiling unlock. Off by default; the GPU is
+  /// still protected by the THERMAL_AP safety cap while unlocked.
+  bool get gpuThermalUnlock => extendedValue(124) == 1;
+
+  bool setGpuThermalUnlock(bool enabled) =>
+      setExtendedOperation(34, enabled ? 1 : 0);
+
   int get thermalConfigMode => extendedValue(19);
 
   bool setThermalConfigMode(int mode) {

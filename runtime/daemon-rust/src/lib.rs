@@ -376,6 +376,18 @@ static DISPLAY_SILKY_STATE: AtomicI32 = AtomicI32::new(-1);
 static DISPLAY_VIDEO_STATE: AtomicI32 = AtomicI32::new(-1);
 static DISPLAY_DOLBY_STATE: AtomicI32 = AtomicI32::new(-1);
 static PERFORMANCE_STATE: AtomicI32 = AtomicI32::new(-1);
+/// Non-zero while a Per-App Controls GPU override owns the Mali profile. The
+/// background drift guard leaves the hardware alone while this is set, so it
+/// cannot reassert the global profile over the app's override.
+static PER_APP_GPU_OVERRIDE: AtomicI32 = AtomicI32::new(0);
+
+fn set_per_app_gpu_override(active: bool) {
+    PER_APP_GPU_OVERRIDE.store(i32::from(active), Ordering::Release);
+}
+
+fn per_app_gpu_override_active() -> bool {
+    PER_APP_GPU_OVERRIDE.load(Ordering::Acquire) != 0
+}
 
 fn abstract_addr(name: &str) -> Result<(SockAddrUn, u32), String> {
     let bytes = name.as_bytes();
@@ -1950,6 +1962,57 @@ fn clear_gpu_cooling_cap() {
     let _ = service_control::write(format!("{}/cur_state", gpu_cooling_device_dir()), "0");
 }
 
+/// GPUEB firmware limit-table rows that hold the GPU below 1612 MHz on this
+/// SoC. `THERMAL_EB` (id 5) is the stock 1430 MHz ceiling; `THERMAL_AP` (id 4)
+/// is the 338 MHz AP-thermal ceiling. Only `THERMAL_EB` is lifted by the opt-in
+/// unlock: `THERMAL_AP` stays armed as the last-resort thermal floor so an
+/// unlocked device still throttles if the AP thermal engine trips.
+const GPU_LIMIT_TABLE: &str = "/proc/gpufreqv2/limit_table";
+const GPU_LIMIT_THERMAL_EB: i32 = 5;
+const GPU_LIMIT_THERMAL_AP: i32 = 4;
+
+/// Enable or lift the stock 1430 MHz `THERMAL_EB` ceiling. Format is
+/// `<id> <ceiling_enable> <floor_enable>`; the community GED tuners use the
+/// same node. This does not touch `THERMAL_AP`, the real thermal safety cap.
+fn set_thermal_unlock(enable: bool) -> Result<(), String> {
+    let ceiling_enable = if enable { 0 } else { 1 };
+    service_control::write(
+        GPU_LIMIT_TABLE,
+        format!("{GPU_LIMIT_THERMAL_EB} {ceiling_enable} 1"),
+    )
+    .map_err(|error| format!("thermal unlock write failed: {error}"))?;
+    // Re-assert THERMAL_AP's ceiling explicitly so a prior unlock run cannot
+    // leave the AP safety cap disabled.
+    service_control::write(GPU_LIMIT_TABLE, format!("{GPU_LIMIT_THERMAL_AP} 1 1"))
+        .map_err(|error| format!("thermal unlock write failed: {error}"))?;
+    mutate_persisted_state(|state| {
+        state.thermal_unlock = if enable { 1 } else { 0 };
+    })?;
+    // Field evidence: the limit_table view is a static format string, so the
+    // real signal is whether the live thermal ceiling / PPM limiter moves.
+    diagnostics::log_event(format!(
+        "thermal unlock {} thermal_ceiling={}mhz ppm={}",
+        if enable { "on" } else { "off" },
+        gpu_thermal_ceiling_mhz().unwrap_or(-1),
+        gpu_ppm_ceiling_summary(),
+    ));
+    Ok(())
+}
+
+/// The GPUFREQ `[PPM Ceiling]` line (`LimitIndex: N, Limiter: M, Priority: P`)
+/// names which limiter is clamping the GPU right now. Logged beside the thermal
+/// unlock so a field report shows whether the ceiling actually lifted.
+fn gpu_ppm_ceiling_summary() -> String {
+    let Some(status) = gpu_read_raw("/proc/gpufreqv2/gpufreq_status") else {
+        return "?".into();
+    };
+    status
+        .lines()
+        .find(|line| line.contains("PPM Ceiling"))
+        .map(|line| line.trim().to_string())
+        .unwrap_or_else(|| "?".into())
+}
+
 fn profile_uses_ged_boost(profile: i32) -> bool {
     matches!(profile, 1 | 3)
 }
@@ -1993,14 +2056,28 @@ fn write_beast_gpu_constraints() {
 fn arm_or_lock_beast_gpu() -> bool {
     write_beast_gpu_constraints();
 
-    if gpu_get_cur_freq_mhz() != 1612 {
+    // The lock condition is the 1612 MHz floor being in force, not the
+    // instantaneous clock. An idle GPU power-collapses below its floor and
+    // reports a low GED OPP, so waiting for `cur == 1612` before freezing left
+    // Beast unfrozen until the GPU happened to become busy -- and on this SoC
+    // the load governor's steady state sits on the 1430 MHz plateau, so it
+    // never became busy enough to reach 1612. Either the devfreq floor reading
+    // 1612 MHz or GED's own floor index reading 0 (`custom_boost_gpu_freq`,
+    // the fastest OPP) means the GPU cannot drop below 1612 once DVFS freezes.
+    // GED's index is the more durable signal: MediaTek's power service
+    // re-clamps the devfreq floor while the GPU sleeps but leaves the custom
+    // index alone.
+    let floored = gpu_get_min_freq_mhz() >= 1612 || gpu_ged_floor_is_fastest();
+    if gpu_get_cur_freq_mhz() != 1612 && !floored {
         let _ = service_control::write("/sys/module/ged/parameters/gpu_dvfs_enable", "1");
         let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "0");
         return false;
     }
 
     let _ = service_control::write("/sys/module/ged/parameters/gpu_dvfs_enable", "0");
-    gpu_get_cur_freq_mhz() == 1612 && gpu_get_dvfs_enabled() == 0
+    // Frozen DVFS on a pinned 1612 MHz floor is the lock. The clock itself may
+    // read low while the GPU is idle; that is expected and still locked.
+    (floored || gpu_get_cur_freq_mhz() == 1612) && gpu_get_dvfs_enabled() == 0
 }
 
 fn settle_beast_gpu_lock(attempts: usize, delay: Duration) -> bool {
@@ -2013,9 +2090,10 @@ fn settle_beast_gpu_lock(attempts: usize, delay: Duration) -> bool {
         std::thread::sleep(delay);
     }
 
-    // Leaving DVFS enabled is intentional. The background guard will lock it
-    // as soon as the GPU becomes active and GED reports OPP 0; disabling it
-    // here would preserve whichever lower boot OPP happened to be current.
+    // Leaving DVFS enabled is intentional. The background guard re-arms Beast
+    // every tick and locks it as soon as the 1612 MHz floor reads back;
+    // disabling it here would preserve whichever lower OPP happened to be
+    // current if the floor writes were rejected.
     let _ = service_control::write("/sys/module/ged/parameters/gpu_dvfs_enable", "1");
     false
 }
@@ -2149,17 +2227,11 @@ pub fn apply_performance_profile(profile: i32) -> Result<(), String> {
         return Err("invalid performance profile".into());
     }
 
-    // A profile transition is one hardware transaction. Exclude the
-    // maintenance and dynamic guards so the previous profile cannot win a
-    // final write while the new Mali state is being established.
-    let _profile_guard = gpu_profile_apply_lock()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let result = apply_performance_profile_hardware(profile);
 
-    let mut verified = enforce_performance_profile(profile);
-
-    PERFORMANCE_STATE.store(profile, Ordering::Release);
-
+    // Only the global profile is persisted. A per-app override drives the
+    // hardware through `apply_performance_profile_hardware` directly and never
+    // reaches here, so it can never rewrite the user's global choice.
     let persistence = match profile {
         3 => mutate_persisted_state(|state| {
             state.perf = 3;
@@ -2207,6 +2279,32 @@ pub fn apply_performance_profile(profile: i32) -> Result<(), String> {
         }),
     };
     persistence?;
+
+    result
+}
+
+/// Apply a GPU profile to the hardware without touching the persisted global
+/// choice. Per-app Per-App Controls use this so an override cannot rewrite the
+/// user's global profile; the global `SET perf` path wraps it with the persist.
+///
+/// `PERFORMANCE_STATE` and the verification flags still track the profile that
+/// is actually live, so `set_gpu_ged_boost` and the readbacks stay coherent
+/// while an override is in force.
+pub fn apply_performance_profile_hardware(profile: i32) -> Result<(), String> {
+    if !matches!(profile, 0..=3) {
+        return Err("invalid performance profile".into());
+    }
+
+    // A profile transition is one hardware transaction. Exclude the
+    // maintenance and dynamic guards so the previous profile cannot win a
+    // final write while the new Mali state is being established.
+    let _profile_guard = gpu_profile_apply_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let mut verified = enforce_performance_profile(profile);
+
+    PERFORMANCE_STATE.store(profile, Ordering::Release);
 
     // Some vendor GED workers can rewrite a flag while the profile transaction
     // is still settling. Reassert the profile-owned boost state after publishing
@@ -3116,6 +3214,7 @@ struct PersistedState {
     gpu_governor: String,
     gpu_ged_boost: i32,
     gpu_uncap: i32,
+    thermal_unlock: i32,
     gpu_power_policy: String,
     cpu_min_freq0: i32,
     cpu_max_freq0: i32,
@@ -3163,6 +3262,7 @@ impl Default for PersistedState {
             gpu_governor: "simple_ondemand".to_string(),
             gpu_ged_boost: 0,
             gpu_uncap: 0,
+            thermal_unlock: 0,
             gpu_power_policy: "coarse_demand".to_string(),
             cpu_min_freq0: -1,
             cpu_max_freq0: -1,
@@ -3479,6 +3579,11 @@ fn parse_persisted_state(raw: &str) -> PersistedState {
                     state.gpu_uncap = v;
                 }
             }
+            "thermal_unlock" => {
+                if let Some(v) = int_value() {
+                    state.thermal_unlock = v;
+                }
+            }
             "gpu_power_policy" => state.gpu_power_policy = value.to_string(),
             "cpu_min_freq0" => {
                 if let Some(v) = int_value() {
@@ -3618,6 +3723,7 @@ fn save_persisted_state(state: &PersistedState) -> Result<(), String> {
     out.push_str(&format!("gpu_governor={}\n", state.gpu_governor));
     out.push_str(&format!("gpu_ged_boost={}\n", state.gpu_ged_boost));
     out.push_str(&format!("gpu_uncap={}\n", state.gpu_uncap));
+    out.push_str(&format!("thermal_unlock={}\n", state.thermal_unlock));
     out.push_str(&format!("gpu_power_policy={}\n", state.gpu_power_policy));
     out.push_str(&format!("cpu_min_freq0={}\n", state.cpu_min_freq0));
     out.push_str(&format!("cpu_max_freq0={}\n", state.cpu_max_freq0));
@@ -4521,6 +4627,7 @@ fn restore_persisted_state() {
         let _ = mutate_persisted_state(|current| {
             if current.perf == persisted.perf {
                 current.gpu_uncap = persisted.gpu_uncap;
+                current.thermal_unlock = persisted.thermal_unlock;
                 current.gpu_min_freq_mhz = persisted.gpu_min_freq_mhz;
                 current.gpu_max_freq_mhz = persisted.gpu_max_freq_mhz;
                 current.gpu_ged_boost = persisted.gpu_ged_boost;
@@ -4630,6 +4737,10 @@ fn restore_persisted_state() {
     // Apply a user-selected MI thermal config mode (sconfig) if one was saved.
     // -1 means follow OEM/mi_thermald and do not override on boot.
     let _ = restore_saved_thermal_mode();
+
+    if state.thermal_unlock == 1 {
+        let _ = set_thermal_unlock(true);
+    }
 
     if state.gpu_uncap == 1 {
         let _ = set_gpu_uncap(true);
@@ -4873,6 +4984,7 @@ fn gaming_dynamic_guard() {
     let mut smoothed_load = 0;
     let mut boost_until = Instant::now();
     let mut last_drift_reassert = Instant::now();
+    let mut last_beast_log = Instant::now();
 
     loop {
         let service_gate = service_control::GATE.read().expect("service gate poisoned");
@@ -4886,6 +4998,19 @@ fn gaming_dynamic_guard() {
             std::thread::sleep(Duration::from_millis(20));
             continue;
         };
+
+        // A Per-App Controls GPU override owns the Mali profile while it is in
+        // force. The guard must not touch the GPU then: it would reassert the
+        // global profile's nodes over the app's override (which is how a stock
+        // global profile dragged per-app gaming clocks back down) and fight the
+        // app's own state. Non-GPU maintenance above and the guard's other
+        // duties are unaffected.
+        if per_app_gpu_override_active() {
+            drop(profile_guard);
+            drop(service_gate);
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
 
         let profile = persisted_state()
             .lock()
@@ -4944,7 +5069,31 @@ fn gaming_dynamic_guard() {
             // MediaTek's power HAL can publish its stock low-power OPP after
             // boot completion. Reassert every Beast-owned node and lock DVFS
             // only after GED confirms that OPP 0 is actually live.
-            let _ = arm_or_lock_beast_gpu();
+            let locked = arm_or_lock_beast_gpu();
+            // Diagnostics: while Beast owns the GPU, record the node state on a
+            // slow cadence so a field report of "stuck below 1612" shows exactly
+            // which node the vendor stack is reclaiming. Two lines a second is
+            // enough to catch a reclaim without flooding the ring.
+            if last_beast_log.elapsed() >= Duration::from_millis(2000) {
+                last_beast_log = Instant::now();
+                if gpu_thermally_capped() {
+                    // The daemon has committed every Beast node but the MTK
+                    // thermal framework is holding the GPU below 1612. Name the
+                    // clamp explicitly so a "still 1430" report is not mistaken
+                    // for a failed GED/devfreq write.
+                    diagnostics::log_event(format!(
+                        "beast thermally capped (locked={}) {}",
+                        locked,
+                        beast_gpu_state()
+                    ));
+                } else {
+                    diagnostics::log_event(format!(
+                        "beast gpu {} (locked={})",
+                        beast_gpu_state(),
+                        locked
+                    ));
+                }
+            }
             drop(profile_guard);
             drop(service_gate);
             std::thread::sleep(Duration::from_millis(100));
@@ -5529,6 +5678,18 @@ fn gpu_write_file(primary: &str, fallback: &str, value: &str) -> Result<(), Stri
     }
 }
 
+/// Whether GED's minimum-frequency floor (`custom_boost_gpu_freq`) currently
+/// points at the fastest OPP, index 0. Beast writes 0 there; row 0 of the
+/// working table is the 1612 MHz OPP, so a pinned floor of 0 holds the GPU at
+/// 1612 once DVFS is frozen. Any other value (or a failed read) is "not
+/// floored" so callers fall back to the live-clock check.
+fn gpu_ged_floor_is_fastest() -> bool {
+    gpu_read_raw("/sys/kernel/ged/hal/custom_boost_gpu_freq")
+        .and_then(|s| s.split_whitespace().next().map(str::to_string))
+        .and_then(|first| first.parse::<i32>().ok())
+        == Some(0)
+}
+
 fn gpu_read_raw(path: &str) -> Option<String> {
     use std::io::Read;
     let mut f = fs::File::open(path).ok()?;
@@ -5887,6 +6048,72 @@ fn gpu_get_uncap_active() -> i32 {
     } else {
         0
     }
+}
+
+/// The MTK thermal framework's live GPU ceiling. `/sys/kernel/thermal/gpu_info`
+/// is `<temp_mC>,<ceiling_hz>,<floor_hz>`; the GPUEB firmware then clamps the
+/// GPU to that ceiling through its `limit_table` (row 5 `THERMAL_EB` is the
+/// default 1430 MHz cap on this SoC). Neither GED nor devfreq writes can beat
+/// it, so Extreme Beast can settle below 1612 even with every node committed.
+/// Returns the ceiling in MHz, or `None` when the node is unavailable.
+fn gpu_thermal_ceiling_mhz() -> Option<i32> {
+    let raw = gpu_read_raw("/sys/kernel/thermal/gpu_info")?;
+    raw.split(',')
+        .nth(1)?
+        .trim()
+        .parse::<i64>()
+        .ok()
+        .map(|hz| (hz / 1_000_000) as i32)
+}
+
+/// Whether the live thermal ceiling is holding the GPU below the 1612 MHz Beast
+/// target. Reported separately from the GED/devfreq state so a field log can
+/// tell a daemon write failure apart from a firmware thermal clamp.
+fn gpu_thermally_capped() -> bool {
+    gpu_thermal_ceiling_mhz().is_some_and(|ceiling| ceiling < 1612)
+}
+
+/// One-line snapshot of every node Extreme Beast drives, for the field log.
+/// The GED custom nodes are indices into the firmware ladder, not frequencies,
+/// so the resolved MHz is printed beside each index where the live table is
+/// available. This is what pins a "locked at 1430" report to a specific node.
+fn beast_gpu_state() -> String {
+    let table = live_gpu_opp_table();
+    let freq_for = |raw: Option<String>| -> String {
+        raw.and_then(|s| {
+            s.split_whitespace()
+                .next()
+                .and_then(|p| p.parse::<i32>().ok())
+        })
+        .map(|index| {
+            let mhz = table
+                .and_then(|t| {
+                    t.iter()
+                        .find(|(i, _)| *i == index)
+                        .map(|(_, khz)| *khz / 1000)
+                })
+                .map(|mhz| format!("{mhz}MHz"))
+                .unwrap_or_else(|| "?".into());
+            format!("{index}({mhz})")
+        })
+        .unwrap_or_else(|| "?".into())
+    };
+    format!(
+        "cur={} min={} max={} gov={} policy={} dvfs={} boost_level={} floor={} ceiling={} ged={} thermal_ceiling={}",
+        gpu_get_cur_freq_mhz(),
+        gpu_get_min_freq_mhz(),
+        gpu_get_max_freq_mhz(),
+        gpu_get_governor(),
+        gpu_get_power_policy(),
+        gpu_get_dvfs_enabled(),
+        gpu_read_raw("/sys/kernel/ged/hal/gpu_boost_level").unwrap_or_else(|| "?".into()),
+        freq_for(gpu_read_raw("/sys/kernel/ged/hal/custom_boost_gpu_freq")),
+        freq_for(gpu_read_raw("/sys/kernel/ged/hal/custom_upbound_gpu_freq")),
+        gpu_get_ged_boost(),
+        gpu_thermal_ceiling_mhz()
+            .map(|mhz| format!("{mhz}MHz"))
+            .unwrap_or_else(|| "?".into()),
+    )
 }
 
 /// Rewrite the stable half of a profile the vendor stack drifted away from.
@@ -6311,6 +6538,10 @@ fn set_gpu_uncap(enable: bool) -> Result<(), String> {
     })?;
 
     if enable && !beast_locked {
+        diagnostics::log_event(format!(
+            "beast uncap armed but not locked: {}",
+            beast_gpu_state()
+        ));
         Err(GPU_UNCAPPED_ARMED.into())
     } else {
         Ok(())
@@ -6499,6 +6730,12 @@ fn snapshot_persistence_fields() -> Vec<String> {
         format!("gpu_gov={}", gpu_get_governor()),
         format!("gpu_ged_boost={}", gpu_get_ged_boost()),
         format!("gpu_thermal_state={}", gpu_get_thermal_state()),
+        format!(
+            "gpu_thermal_ceiling={}",
+            gpu_thermal_ceiling_mhz().unwrap_or(-1)
+        ),
+        format!("gpu_thermally_capped={}", i32::from(gpu_thermally_capped())),
+        format!("gpu_thermal_unlock={}", state.thermal_unlock),
         format!("gpu_uncap_active={}", gpu_get_uncap_active()),
         format!(
             "gpu_power_policy={}",
@@ -7569,6 +7806,11 @@ fn handle_enabled_command(line: &str) -> String {
             .and_then(|v| set_gpu_uncap(v == 1))
     } else if cmd == "ACTION gpu.uncap_full_speed" {
         set_gpu_uncap(true)
+    } else if let Some(arg) = cmd.strip_prefix("SET gpu.thermal_unlock ") {
+        arg.trim()
+            .parse::<i32>()
+            .map_err(|_| "bad thermal unlock flag".to_string())
+            .and_then(|v| set_thermal_unlock(v == 1))
     } else if let Some(arg) = cmd.strip_prefix("SET thermal.sconfig ") {
         match arg.trim().parse::<i32>() {
             Ok(mode) => apply_thermal_mode(mode),
@@ -7671,7 +7913,7 @@ pub fn serve_client(stream: UnixStream) {
 mod tests {
     use super::{
         GPU_UNCAPPED_ARMED, GpuReadings, gpu_profile_matches, gpu_profile_matches_reading,
-        gpu_uncap_armed,
+        gpu_uncap_armed, per_app_gpu_override_active, set_per_app_gpu_override,
     };
 
     fn readings<'a>(
@@ -8229,6 +8471,32 @@ posdiv: 0, margin:     0, power:     0\n";
         // GED's indices untouched instead of pinning a guessed floor.
         assert_eq!(opp_index_for_freq_mhz(&[], 338, FreqBound::AtLeast), None);
         assert_eq!(opp_index_for_freq_mhz(&[], 598, FreqBound::AtMost), None);
+    }
+
+    #[test]
+    fn per_app_gpu_override_gate_toggles() {
+        // The guard reads this flag to decide whether it may touch the Mali
+        // nodes. A per-app GPU apply sets it, the restore clears it.
+        set_per_app_gpu_override(false);
+        assert!(!per_app_gpu_override_active());
+        set_per_app_gpu_override(true);
+        assert!(per_app_gpu_override_active());
+        set_per_app_gpu_override(false);
+        assert!(!per_app_gpu_override_active());
+    }
+
+    #[test]
+    fn beast_ceiling_resolves_to_the_true_1612_index() {
+        // Beast pins the ceiling to the fastest OPP. On the real 52-entry ladder
+        // that is index 0 (1612 MHz), not the top of the 1430 MHz plateau the
+        // vendor's stock policy sits on, so a "Beast capped at 1430" report can
+        // only come from the write not sticking, never from the index choice.
+        let dash = dash_working_opp_table();
+        assert_eq!(
+            opp_index_for_freq_mhz(&dash, 1_612, FreqBound::AtMost),
+            Some(0)
+        );
+        assert_eq!(dash[7], (7, 1_430_000));
     }
 
     #[test]

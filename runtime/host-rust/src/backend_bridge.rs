@@ -16,7 +16,7 @@ const SOCKET_NAME: &str = "dash_essentiald_v15";
 const REVERSE_SOCKET_NAME: &str = "dash_essential_app_v15";
 const LOOPBACK_PORT: u16 = 732;
 const LOOPBACK_PRIVILEGE_PROBE_PORT: u16 = 731;
-const EXTENDED_VALUE_COUNT: usize = 122;
+const EXTENDED_VALUE_COUNT: usize = 125;
 
 #[repr(C)]
 struct SockAddrUn {
@@ -856,6 +856,9 @@ fn refresh(cache: &Cache) -> Result<(), String> {
         ("bypass_threshold", 119),
         ("bypass_phase", 120),
         ("bypass_error", 121),
+        ("gpu_thermal_ceiling", 122),
+        ("gpu_thermally_capped", 123),
+        ("gpu_thermal_unlock", 124),
     ];
 
     for &(key, index) in extended_fields {
@@ -1162,6 +1165,12 @@ fn perform(command: Command) -> Result<(), String> {
                     return request(&format!("SET thermal.sconfig {a}")).map(|_| ());
                 }
                 33 => "ACTION thermal.sconfig.reset".to_string(),
+                34 if matches!(a, 0 | 1) => {
+                    if let Some(r) = runtime() {
+                        r.cache.extended[124].store(a, Ordering::Release);
+                    }
+                    return request(&format!("SET gpu.thermal_unlock {a}")).map(|_| ());
+                }
                 _ => return Err("invalid extended command".into()),
             };
 

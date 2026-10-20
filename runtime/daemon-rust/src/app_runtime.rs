@@ -371,7 +371,15 @@ impl Hardware for Adapter {
         let _temporary = Temporary::begin();
         let result = match (c, target) {
             (Control::Touch, Target::Touch(v)) => set_touch_profile(*v as i32),
-            (Control::Gpu, Target::Gpu(v)) => apply_performance_profile(*v as i32),
+            (Control::Gpu, Target::Gpu(v)) => {
+                // Per-app GPU is a hardware override, not a global profile
+                // change. Marking the override makes the drift guard leave the
+                // Mali nodes alone, and the hardware-only apply never rewrites
+                // the user's global `perf` choice, so a stock global profile
+                // cannot drag the app's gaming clocks back down.
+                set_per_app_gpu_override(true);
+                apply_performance_profile_hardware(*v as i32)
+            }
             // Hardware write only: the saved global choice stays in
             // PersistedState.thermal_mode and is restored by copy_preference.
             (Control::Thermal, Target::Thermal(v)) => write_mi_thermal_config_mode(*v),
@@ -442,6 +450,9 @@ impl Hardware for Adapter {
                             return Err(error);
                         }
                     }
+                    // The global profile is back in force: hand the Mali nodes
+                    // back to the drift guard.
+                    set_per_app_gpu_override(false);
                 }
                 Control::CpuRange(p) => {
                     let desired = persisted_cpu_range(&saved.state, *p as i32).unwrap_or((
