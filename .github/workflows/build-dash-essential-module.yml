@@ -249,7 +249,7 @@ jobs:
           # above are static; this keeps the notes in lockstep with CHANGELOG.md
           # so no separate API patch is ever needed.
           version="${GITHUB_REF_NAME#v}"
-          changelog="$(awk -v want="$version" '
+          changelog="$(awk -v want="${version%%-*}" '
             $0 == "## " want { capture = 1 }
             capture && /^## / && $0 != "## " want { exit }
             capture { print }
@@ -309,7 +309,7 @@ jobs:
           fi
 
           version="${GITHUB_REF_NAME#v}"
-          body="$(awk -v want="$version" '
+          body="$(awk -v want="${version%%-*}" '
             $0 == "## " want {inside=1; next}
             inside && /^## / {exit}
             inside {print}
