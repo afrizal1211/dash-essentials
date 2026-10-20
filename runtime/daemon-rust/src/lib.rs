@@ -5908,9 +5908,13 @@ fn gpu_profile_configured(profile: i32) -> bool {
 
     match profile {
         3 => {
+            // Static Beast configuration. `gpu_profile_verified` additionally
+            // gates on the live OPP clock at 1612; that read can stall on an
+            // idle, clock-gated GPU (GED APO) even with the 1612 devfreq floor
+            // committed, so the configured check stays clock-independent and
+            // the ladder rises as soon as the game submits frames.
             min == 1612
                 && max == 1612
-                && gpu_get_cur_freq_mhz() == 1612
                 && governor == "performance"
                 && gpu_boost_pipeline_matches(true)
                 && dvfs == 0

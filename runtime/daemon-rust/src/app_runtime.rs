@@ -125,9 +125,14 @@ fn cluster_online(policy: u8) -> bool {
 // The kernel removes a cpufreq policy's scaling nodes while every core of
 // the cluster is parked; bring them back so the write can happen. Offline
 // cores return to the captured mask once the original values are restored.
+// CPU0 is pinned online by the kernel, so bringing a cluster up only ever
+// writes CPU1-CPU7 (write_cpu_online rejects CPU0).
 fn bring_cluster_online(policy: u8) -> Result<(), String> {
     let mut errors = Vec::<String>::new();
     for cpu in cluster_cores(policy) {
+        if *cpu == 0 {
+            continue;
+        }
         if let Err(error) = write_cpu_online(*cpu, true) {
             errors.push(error);
         }
@@ -160,7 +165,7 @@ fn restore_parked_cores(c: &Control, saved: &Saved) -> Result<(), String> {
                 return Ok(());
             }
             if let Err(error) = park_offline_again(saved.online_mask) {
-                eprintln!("APP_RUNTIME park restore {error}");
+                eprintln!("DASH_APP_PARK_RESTORE {error}");
             }
             Ok(())
         }

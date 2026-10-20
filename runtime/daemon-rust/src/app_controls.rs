@@ -675,8 +675,7 @@ mod tests {
         // An alphanumeric name parses; with a parked cluster (no discovered
         // table) live sysfs stays the name authority via the apply path.
         let unknown = Profile::parse(&json!({"cpu":{"7":{"governor":"turbo"}}})).unwrap();
-        let parked = Capabilities::default();
-        let mut parked = parked;
+        let mut parked = Capabilities::default();
         parked.cpu_governors.insert(7, BTreeSet::new());
         assert!(parked.validate(&unknown).is_ok());
     }

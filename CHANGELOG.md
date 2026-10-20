@@ -75,9 +75,14 @@ original wording.
   accepted (live sysfs verifies the write), the capability probe borrows
   the shared governor set, applying or restoring a range/governor brings
   the cluster's cores back online, and release parks them back to the
-  captured mask. Per-app GPU controls were audited and need no change:
-  the Mali devfreq nodes persist through power collapse and GPU profile
-  writes fail soft.
+  captured mask. Per-app GPU controls were audited for the same parked
+  resource class: the Mali devfreq nodes persist through power collapse and
+  GPU profile writes fail soft. Extreme Beast (profile 3) additionally
+  checks its accepted state by configuration (1612/1612 devfreq bounds,
+  performance governor, GED boost pipeline, always_on policy) and no
+  longer requires the live OPP clock to already read 1612, which an idle,
+  clock-gated GPU cannot report at toggle time; the clock check stays in
+  the strict verified path for diagnostics.
 
 
 ## 1.18.6
