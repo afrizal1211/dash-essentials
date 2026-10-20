@@ -507,6 +507,7 @@ pub unsafe extern "C" fn dash_backend_app_controls_exchange(
         || command.starts_with("ACTION subsystem.clocks.range storage ")
         || command == "ACTION subsystem.clocks.trial storage"
         || command == "GET update.status"
+        || command == "GET diagnostics.log"
         || command.starts_with("SET update.install_apk ")
         || command.starts_with("SET update.flash_module "))
     {

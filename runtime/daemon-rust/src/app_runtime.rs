@@ -369,7 +369,7 @@ impl Hardware for Adapter {
             }
         }
         let _temporary = Temporary::begin();
-        match (c, target) {
+        let result = match (c, target) {
             (Control::Touch, Target::Touch(v)) => set_touch_profile(*v as i32),
             (Control::Gpu, Target::Gpu(v)) => apply_performance_profile(*v as i32),
             // Hardware write only: the saved global choice stays in
@@ -396,108 +396,121 @@ impl Hardware for Adapter {
             }
             (Control::Refresh, Target::Refresh(hz)) => apply_refresh(*hz),
             _ => Err("invalid per-app target".into()),
-        }
+        };
+        diagnostics::log_event(match &result {
+            Ok(()) => format!("per-app apply {name} -> ok"),
+            Err(error) => format!("per-app apply {name} -> ERR {error}"),
+        });
+        result
     }
     fn restore(&mut self, c: &Control, saved: &Saved) -> Result<(), String> {
-        let _temporary = Temporary::begin();
-        match c {
-            Control::Touch => set_touch_profile(saved.state.touch.max(0))?,
-            Control::Gpu => {
-                apply_performance_profile(saved.state.perf)?;
-                let min = saved.state.gpu_min_freq_mhz;
-                let max = saved.state.gpu_max_freq_mhz;
-                if min > 0 && max >= min {
-                    set_gpu_min_freq(338)?;
-                    set_gpu_max_freq(max)?;
-                    set_gpu_min_freq(min)?;
+        let name = key(c);
+        let result = (|| {
+            let _temporary = Temporary::begin();
+            match c {
+                Control::Touch => set_touch_profile(saved.state.touch.max(0))?,
+                Control::Gpu => {
+                    apply_performance_profile(saved.state.perf)?;
+                    let min = saved.state.gpu_min_freq_mhz;
+                    let max = saved.state.gpu_max_freq_mhz;
+                    if min > 0 && max >= min {
+                        set_gpu_min_freq(338)?;
+                        set_gpu_max_freq(max)?;
+                        set_gpu_min_freq(min)?;
+                    }
+                    let governor = if !saved.state.gpu_governor.is_empty() {
+                        &saved.state.gpu_governor
+                    } else {
+                        &saved.state.gpu
+                    };
+                    if !governor.is_empty() {
+                        set_gpu_governor(governor)?;
+                    }
+                    if !saved.state.gpu_power_policy.is_empty() {
+                        set_gpu_power_policy(&saved.state.gpu_power_policy)?;
+                    }
+                    if saved.state.gpu_uncap == 1 {
+                        set_gpu_uncap(true)?;
+                    }
                 }
-                let governor = if !saved.state.gpu_governor.is_empty() {
-                    &saved.state.gpu_governor
-                } else {
-                    &saved.state.gpu
-                };
-                if !governor.is_empty() {
-                    set_gpu_governor(governor)?;
+                Control::CpuRange(p) => {
+                    let desired = persisted_cpu_range(&saved.state, *p as i32).unwrap_or((
+                        saved.live[0]
+                            .as_i64()
+                            .ok_or("missing original CPU minimum")? as i32,
+                        saved.live[1]
+                            .as_i64()
+                            .ok_or("missing original CPU maximum")? as i32,
+                    ));
+                    wake_cluster(*p)?;
+                    apply_cluster_freq_controls(*p as i32, desired.0, desired.1)?;
+                    restore_parked_cores(c, saved)?;
                 }
-                if !saved.state.gpu_power_policy.is_empty() {
-                    set_gpu_power_policy(&saved.state.gpu_power_policy)?;
+                Control::CpuGovernor(p) => {
+                    let original = saved.live.as_str().ok_or("missing original governor")?;
+                    wake_cluster(*p)?;
+                    set_cpu_governor(*p as i32, original)?;
+                    restore_parked_cores(c, saved)?;
                 }
-                if saved.state.gpu_uncap == 1 {
-                    set_gpu_uncap(true)?;
+                Control::Thermal => {
+                    // The saved global choice wins when one exists; otherwise hand
+                    // the journaled OEM baseline back to mi_thermald so the last
+                    // profile mode cannot stick. copy_preference below reinstalls
+                    // the global thermal_mode afterwards.
+                    if saved.state.thermal_mode >= 0 {
+                        write_mi_thermal_config_mode(saved.state.thermal_mode)?;
+                    } else {
+                        release_mi_thermal_to_oem()?;
+                    }
                 }
+                Control::CpuCores => {
+                    if saved.state.cpu_manual == 1 {
+                        set_cpu_manual(true)?;
+                        apply_saved_cpu_mask(saved.state.cpu_online_mask)?;
+                    } else {
+                        set_cpu_manual(false)?;
+                    }
+                }
+                Control::Refresh => restore_refresh(&saved.live)?,
             }
-            Control::CpuRange(p) => {
-                let desired = persisted_cpu_range(&saved.state, *p as i32).unwrap_or((
-                    saved.live[0]
-                        .as_i64()
-                        .ok_or("missing original CPU minimum")? as i32,
-                    saved.live[1]
-                        .as_i64()
-                        .ok_or("missing original CPU maximum")? as i32,
-                ));
-                wake_cluster(*p)?;
-                apply_cluster_freq_controls(*p as i32, desired.0, desired.1)?;
-                restore_parked_cores(c, saved)?;
-            }
-            Control::CpuGovernor(p) => {
-                let original = saved.live.as_str().ok_or("missing original governor")?;
-                wake_cluster(*p)?;
-                set_cpu_governor(*p as i32, original)?;
-                restore_parked_cores(c, saved)?;
-            }
-            Control::Thermal => {
-                // The saved global choice wins when one exists; otherwise hand
-                // the journaled OEM baseline back to mi_thermald so the last
-                // profile mode cannot stick. copy_preference below reinstalls
-                // the global thermal_mode afterwards.
-                if saved.state.thermal_mode >= 0 {
-                    write_mi_thermal_config_mode(saved.state.thermal_mode)?;
-                } else {
-                    release_mi_thermal_to_oem()?;
-                }
-            }
-            Control::CpuCores => {
-                if saved.state.cpu_manual == 1 {
-                    set_cpu_manual(true)?;
-                    apply_saved_cpu_mask(saved.state.cpu_online_mask)?;
-                } else {
-                    set_cpu_manual(false)?;
-                }
-            }
-            Control::Refresh => restore_refresh(&saved.live)?,
-        }
-        mutate_persisted_state(|state| copy_preference(c, &saved.state, state))?;
-        if matches!(c, Control::CpuRange(_)) {
-            let _lock = cpu_freq_apply_lock()
-                .lock()
-                .map_err(|_| "CPU apply lock poisoned")?;
-            let ranges_active = persisted_cpu_ranges_active(
-                &persisted_state()
+            mutate_persisted_state(|state| copy_preference(c, &saved.state, state))?;
+            if matches!(c, Control::CpuRange(_)) {
+                let _lock = cpu_freq_apply_lock()
                     .lock()
-                    .map_err(|_| "state lock poisoned")?
-                    .clone(),
-            );
-            if !ranges_active {
-                // A restarted daemon may have captured the temporary thermal
-                // mode as its startup baseline. The journal owns the original.
-                let original = saved
-                    .live
-                    .get(2)
-                    .and_then(Value::as_i64)
-                    .map(|v| v as i32)
-                    .unwrap_or(saved.state.cpu_thermal_mode_prev);
-                if original >= 0 {
-                    mutate_persisted_state(|state| state.cpu_thermal_mode_prev = original)?;
+                    .map_err(|_| "CPU apply lock poisoned")?;
+                let ranges_active = persisted_cpu_ranges_active(
+                    &persisted_state()
+                        .lock()
+                        .map_err(|_| "state lock poisoned")?
+                        .clone(),
+                );
+                if !ranges_active {
+                    // A restarted daemon may have captured the temporary thermal
+                    // mode as its startup baseline. The journal owns the original.
+                    let original = saved
+                        .live
+                        .get(2)
+                        .and_then(Value::as_i64)
+                        .map(|v| v as i32)
+                        .unwrap_or(saved.state.cpu_thermal_mode_prev);
+                    if original >= 0 {
+                        mutate_persisted_state(|state| state.cpu_thermal_mode_prev = original)?;
+                    }
+                    restore_cpu_thermal_mode_unlocked()?;
                 }
-                restore_cpu_thermal_mode_unlocked()?;
             }
-        }
-        let mut entries = originals().lock().map_err(|_| "originals lock poisoned")?;
-        let mut candidate = entries.clone();
-        candidate.remove(&key(c));
-        journal(&candidate)?;
-        *entries = candidate;
-        Ok(())
+            let mut entries = originals().lock().map_err(|_| "originals lock poisoned")?;
+            let mut candidate = entries.clone();
+            candidate.remove(&key(c));
+            journal(&candidate)?;
+            *entries = candidate;
+            Ok(())
+        })();
+        diagnostics::log_event(match &result {
+            Ok(()) => format!("per-app restore {name} -> ok"),
+            Err(error) => format!("per-app restore {name} -> ERR {error}"),
+        });
+        result
     }
 }
 
@@ -871,6 +884,7 @@ fn reconcile(r: &mut Runtime) -> Result<(), String> {
     if r.config_error.is_some() {
         return Err("per-app configuration is damaged; reset profiles to recover".into());
     }
+    let previous_foreground = r.foreground.clone();
     if service_control::enabled() && r.config.enabled {
         r.foreground = match foreground() {
             Ok(app) => app,
@@ -878,6 +892,7 @@ fn reconcile(r: &mut Runtime) -> Result<(), String> {
                 r.owner
                     .transition(&mut Adapter::new(), None, None, false, false)?;
                 r.foreground = None;
+                diagnostics::log_event(format!("foreground read failed: {error}"));
                 return Err(error);
             }
         };
@@ -888,13 +903,40 @@ fn reconcile(r: &mut Runtime) -> Result<(), String> {
         .foreground
         .as_ref()
         .and_then(|app| r.config.profiles.get(app));
-    r.owner.transition(
+    let result = r.owner.transition(
         &mut Adapter::new(),
         r.foreground.as_ref(),
         profile,
         service_control::enabled(),
         r.config.enabled,
-    )
+    );
+    if previous_foreground != r.foreground {
+        diagnostics::log_event(match &r.foreground {
+            Some(app) => {
+                format!(
+                    "foreground {} entered (profile={})",
+                    app.package,
+                    profile
+                        .map(|p| format!("{} controls", p.controls.len()))
+                        .unwrap_or_else(|| "none".into())
+                )
+            }
+            None => format!(
+                "foreground left (was {})",
+                previous_foreground
+                    .as_ref()
+                    .map(|a| a.package.as_str())
+                    .unwrap_or("none")
+            ),
+        });
+    }
+    if let Err(error) = &result {
+        diagnostics::log_event(format!(
+            "per-app transition failed (foreground={:?}): {error}",
+            r.foreground.as_ref().map(|a| a.package.as_str())
+        ));
+    }
+    result
 }
 fn status(r: &Runtime) -> Value {
     let (state, owner) = match &r.owner.status {

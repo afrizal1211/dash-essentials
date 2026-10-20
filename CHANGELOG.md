@@ -106,6 +106,31 @@ original wording.
   alongside the zip and APK so the updater never has to trust a bare
   download.
 
+## 1.18.8
+
+Codename: Sakura.
+
+- Gaming Dynamic and Battery Saver keep their GPU settings. On this SoC the
+  vendor GED/power stack quietly reinstates its own ceiling and devfreq ladder
+  while the GPU idles, collapsing the Mali clock to the lowest OPP. Only
+  Extreme Beast reasserted its configuration every tick, so the other two
+  profiles silently lost theirs while still showing as active. The dynamic
+  guard now detects the reclamp and rewrites the stable nodes (ceiling, floor,
+  governor, GED ceiling index, power policy) on a rate limit, without touching
+  the Gaming Dynamic load ramp.
+- The Extreme Beast target reads 1.61 GHz everywhere. The preset, the mode
+  cards and the live readout said 1.30 GHz while the profile actually locks the
+  GPU at 1612 MHz; the copy now matches the hardware ceiling.
+- The installed-app chooser resolves display names as you browse. Labels are
+  fetched per visible page instead of one all-packages sweep that blocked the
+  list and failed silently with no visible names and no hint. A failed batch is
+  retried and a `Retry names` action appears when PackageManager cannot be read.
+- Dash Essential now keeps a field log. Every profile transition, rejected
+  command, per-app apply/restore and GPU drift reassert is recorded in a bounded
+  in-memory ring and a size-capped file under the module state directory, and
+  exposed to the app as `GET diagnostics.log` so failures can be attached
+  instead of guessed at.
+
 ## 1.18.7
 
 - The port's releases now carry a codename. `Afuri` is the first one: the

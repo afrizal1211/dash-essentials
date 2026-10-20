@@ -7,6 +7,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart' show Drag;
+import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 import 'package:flutter/rendering.dart';
 import 'package:flutter/physics.dart';
 import 'package:flutter/scheduler.dart';
@@ -3123,8 +3124,8 @@ class _HomePulseHero extends StatelessWidget {
         };
         final String profileDescription = switch (activePerf) {
           2 => 'Efficiency-first clocks and reduced power demand',
-          1 => 'Unrestricted 260–1300 MHz GPU scaling with GED boost',
-          3 => 'GPU locked at the 1300 MHz hardware ceiling',
+          1 => 'Unrestricted 260–1612 MHz GPU scaling with GED boost',
+          3 => 'GPU locked at the 1612 MHz hardware ceiling',
           _ => 'OEM-balanced performance and efficiency for everyday use',
         };
         final int onlineCores = _dashOnlineCoreCount(snapshot);
@@ -4404,17 +4405,17 @@ class HubsScreen extends StatelessWidget {
             : 260;
         final int rawMaxFreq = backend.extendedValue(48) >= 0
             ? backend.extendedValue(48)
-            : 1300;
+            : 1612;
         final int rawUncap = backend.extendedValue(52);
         final int activePerf = snapshot.performanceProfile >= 0
             ? snapshot.performanceProfile
             : 0;
         final bool isBeast =
-            (rawUncap == 1 && rawMinFreq == 1300 && rawMaxFreq == 1300) ||
+            (rawUncap == 1 && rawMinFreq == 1612 && rawMaxFreq == 1612) ||
             activePerf == 3;
         final String gpuLabel = liveGpuFreq >= 260
             ? '$liveGpuFreq MHz'
-            : (isBeast ? '1300 MHz' : '$rawMaxFreq MHz');
+            : (isBeast ? '1612 MHz' : '$rawMaxFreq MHz');
         final String displayMode = switch (snapshot.displayColor) {
           0 => 'Original PRO',
           1 => 'Vivid',
@@ -5232,6 +5233,11 @@ class SupportScreen extends StatelessWidget {
         const SizedBox(height: 8),
         const _UpdateCard(),
 
+        const SizedBox(height: 16),
+        const SectionLabel('Diagnostics'),
+        const SizedBox(height: 8),
+        const _DiagnosticsCard(),
+
         const SizedBox(height: 8),
 
         // Upstream source Card
@@ -5604,6 +5610,175 @@ class _UpdateCardState extends State<_UpdateCard> {
             ],
           ],
           banner,
+        ],
+      ),
+    );
+  }
+}
+
+class _DiagnosticsCard extends StatefulWidget {
+  const _DiagnosticsCard();
+
+  @override
+  State<_DiagnosticsCard> createState() => _DiagnosticsCardState();
+}
+
+class _DiagnosticsCardState extends State<_DiagnosticsCard> {
+  List<String> _lines = const <String>[];
+  String? _path;
+  String? _error;
+  bool _busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_load());
+  }
+
+  Future<void> _load() async {
+    if (_busy) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final dynamic reply = await PerAppBackend.instance.command(
+        'GET diagnostics.log',
+      );
+      final Map<String, dynamic> map = Map<String, dynamic>.from(reply as Map);
+      if (!mounted) return;
+      setState(() {
+        _lines =
+            (map['lines'] as List?)
+                ?.map((dynamic line) => '$line')
+                .toList() ??
+            const <String>[];
+        _path = map['path'] as String?;
+      });
+    } catch (error) {
+      if (mounted) {
+        setState(
+          () => _error = error.toString().replaceFirst('Bad state: ', ''),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ColorScheme colors = Theme.of(context).colorScheme;
+    final bool dark = Theme.of(context).brightness == Brightness.dark;
+    final List<String> tail = _lines.length > 200
+        ? _lines.sublist(_lines.length - 200)
+        : _lines;
+    return SurfaceCard(
+      accent: colors.secondary,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              Icon(
+                Icons.receipt_long_rounded,
+                size: 18,
+                color: colors.secondary,
+              ),
+              const SizedBox(width: 8),
+              const Expanded(
+                child: Text(
+                  'Field log',
+                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.w800),
+                ),
+              ),
+              IconButton(
+                onPressed: _busy ? null : _load,
+                icon: _busy
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.refresh_rounded, size: 20),
+                tooltip: 'Load diagnostics',
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'GPU profile transitions, per-app apply/restore and rejected '
+            'commands, newest last. Attach this when reporting a problem.',
+            style: TextStyle(
+              fontSize: 11,
+              height: 1.4,
+              color: colors.onSurfaceVariant,
+            ),
+          ),
+          if (_error != null) ...<Widget>[
+            const SizedBox(height: 10),
+            Text(_error!, style: TextStyle(fontSize: 12, color: colors.error)),
+          ],
+          if (tail.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 10),
+            if (_path != null && _path!.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Text(
+                  _path!,
+                  style: TextStyle(
+                    fontSize: 10,
+                    color: colors.onSurfaceVariant.withValues(alpha: 0.7),
+                  ),
+                ),
+              ),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: colors.surfaceContainer.withValues(
+                  alpha: dark ? 0.4 : 0.5,
+                ),
+                borderRadius: BorderRadius.circular(11),
+              ),
+              constraints: const BoxConstraints(maxHeight: 220),
+              child: SingleChildScrollView(
+                reverse: true,
+                child: SelectableText(
+                  tail.join('\n'),
+                  style: const TextStyle(
+                    fontSize: 10.5,
+                    height: 1.4,
+                    fontFamily: 'monospace',
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: <Widget>[
+                Expanded(
+                  child: Text(
+                    '${_lines.length} lines buffered',
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: colors.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+                TextButton.icon(
+                  onPressed: () {
+                    Clipboard.setData(ClipboardData(text: tail.join('\n')));
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Diagnostics copied')),
+                    );
+                  },
+                  icon: const Icon(Icons.copy_rounded, size: 16),
+                  label: const Text('Copy', style: TextStyle(fontSize: 12)),
+                ),
+              ],
+            ),
+          ],
         ],
       ),
     );
@@ -12458,7 +12633,7 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
       _optimisticProfile = 0;
       _optimisticUncap = false;
       _optimisticMinFreq = 260;
-      _optimisticMaxFreq = 1300;
+      _optimisticMaxFreq = 1612;
       _optimisticGov = 4;
       _optimisticGedBoost = false;
       _optimisticPowerPolicy = 0;
@@ -12509,7 +12684,7 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
             : 260;
         final int rawMaxFreq = backend.extendedValue(48) >= 0
             ? backend.extendedValue(48)
-            : 1300;
+            : 1612;
         final int rawGovCode = backend.extendedValue(49) >= 0
             ? backend.extendedValue(49)
             : 0;
@@ -12536,8 +12711,8 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
                 ? snapshot.performanceProfile
                 : 0);
         final int requestedMaxFreq = switch (activePerf) {
-          3 => 1300,
-          1 => 1300,
+          3 => 1612,
+          1 => 1612,
           2 => 598,
           _ => rawMaxFreq,
         };
@@ -12545,14 +12720,14 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
         final bool isThrottledByOs =
             hasHardwareReadback &&
             ((activePerf == 3 &&
-                    ((liveCurFreq > 0 && liveCurFreq < 1300) ||
+                    ((liveCurFreq > 0 && liveCurFreq < 1612) ||
                         rawMaxFreq < requestedMaxFreq)) ||
                 ((activePerf == 1 || activePerf == 2) &&
                     rawMaxFreq < requestedMaxFreq));
         final bool isBeast =
             activePerf == 3 ||
             isUncapped ||
-            (activeMinFreq == 1300 && activeMaxFreq == 1300);
+            (activeMinFreq == 1612 && activeMaxFreq == 1612);
         final bool isGaming = !isBeast && activePerf == 1;
         final bool isBattery = !isBeast && activePerf == 2;
         final Color mainColor = isBeast
@@ -12571,12 +12746,12 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
                         : Icons.balance_rounded));
         final String modeSummary = isBeast
             ? (liveCurFreq > 0
-                  ? 'Live: $liveCurFreq MHz · Fixed at 1.30 GHz'
-                  : 'Applying fixed 1.30 GHz lock')
+                  ? 'Live: $liveCurFreq MHz · Fixed at 1.61 GHz'
+                  : 'Applying fixed 1.61 GHz lock')
             : (isGaming
                   ? (liveCurFreq > 0
-                        ? 'Live: $liveCurFreq MHz · Scaling freely to 1.30 GHz'
-                        : 'Full-range scaling · 260–1300 MHz')
+                        ? 'Live: $liveCurFreq MHz · Scaling freely to 1.61 GHz'
+                        : 'Full-range scaling · 260–1612 MHz')
                   : (isBattery
                         ? (liveCurFreq > 0
                               ? 'Live: $liveCurFreq MHz · Efficiency cap at 598 MHz'
@@ -12710,7 +12885,7 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
     final bool isBeast =
         activeProfile == 3 ||
         isUncapped ||
-        (minFreq == 1300 && maxFreq == 1300);
+        (minFreq == 1612 && maxFreq == 1612);
     final bool isGaming = !isBeast && activeProfile == 1;
     final bool isBattery = !isBeast && activeProfile == 2;
 
@@ -12726,14 +12901,14 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
 
     final String clockSubtext = isBeast
         ? (isThrottledByOs
-              ? 'External clock limit detected · 1300 MHz remains the target'
-              : (profileVerified && liveCurFreq == 1300
-                    ? 'Fixed 1.30 GHz target verified from live hardware telemetry'
-                    : 'Fixed 1.30 GHz target requested · waiting for live verification'))
+              ? 'External clock limit detected · 1612 MHz remains the target'
+              : (profileVerified && liveCurFreq == 1612
+                    ? 'Fixed 1.61 GHz target verified from live hardware telemetry'
+                    : 'Fixed 1.61 GHz target requested · waiting for live verification'))
         : (isGaming
               ? (liveCurFreq > 0
-                    ? 'Dynamic Gaming Load ($liveCurFreq MHz · 1.30 GHz Ceiling)'
-                    : 'Standby Dynamic (260 – 1300 MHz · GED Boost Active)')
+                    ? 'Dynamic Gaming Load ($liveCurFreq MHz · 1.61 GHz Ceiling)'
+                    : 'Standby Dynamic (260 – 1612 MHz · GED Boost Active)')
               : (isBattery
                     ? (liveCurFreq > 0
                           ? 'Live $liveCurFreq MHz · $minFreq–$maxFreq MHz Battery Range'
@@ -12743,7 +12918,7 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
                           : 'Waiting for OEM GPU telemetry')));
 
     final String badgeTitle = isBeast
-        ? '1.30 GHz FIXED TARGET'
+        ? '1.61 GHz FIXED TARGET'
         : (isGaming
               ? 'GAMING DYNAMIC BOOST'
               : (isBattery ? 'BATTERY SAVER CLAMP' : 'DYNAMIC BALANCED'));
@@ -12796,7 +12971,7 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
                   ],
                 ),
               ),
-              if (maxFreq >= 1300)
+              if (maxFreq >= 1612)
                 Container(
                   padding: const EdgeInsets.symmetric(
                     horizontal: 8,
@@ -12810,7 +12985,7 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
                     ),
                   ),
                   child: const Text(
-                    '1.30 GHz Target',
+                    '1.61 GHz Target',
                     style: TextStyle(
                       fontSize: 10.5,
                       fontWeight: FontWeight.w800,
@@ -13019,7 +13194,7 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
   }) {
     final bool isBeast =
         activeProfile == 3 ||
-        (activeProfile < 0 && isUncapped && minFreq == 1300 && maxFreq == 1300);
+        (activeProfile < 0 && isUncapped && minFreq == 1612 && maxFreq == 1612);
     final bool isGaming = activeProfile == 1;
     final bool isBattery = activeProfile == 2;
     final bool isStock = !isBeast && !isGaming && !isBattery;
@@ -13044,18 +13219,18 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
                 isDark: isDark,
                 colors: colors,
                 title: 'Extreme Beast',
-                range: '1300 MHz fixed · No downclock',
+                range: '1612 MHz fixed · No downclock',
                 icon: Icons.bolt_rounded,
                 accent: const Color(0xFFFF5252),
                 isActive: isBeast,
                 onTap: () => onSelect(
                   3,
-                  1300,
-                  1300,
+                  1612,
+                  1612,
                   1,
                   true,
                   1,
-                  'Extreme Beast · Fixed 1.30 GHz',
+                  'Extreme Beast · Fixed 1.61 GHz',
                   Icons.bolt_rounded,
                   const Color(0xFFFF5252),
                 ),
@@ -13067,14 +13242,14 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
                 isDark: isDark,
                 colors: colors,
                 title: 'Gaming Dynamic',
-                range: '260–1300 MHz · Full-range scaling',
+                range: '260–1612 MHz · Full-range scaling',
                 icon: Icons.sports_esports_rounded,
                 accent: const Color(0xFFFFB84D),
                 isActive: isGaming,
                 onTap: () => onSelect(
                   1,
                   260,
-                  1300,
+                  1612,
                   0,
                   true,
                   1,
@@ -13101,7 +13276,7 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
                 onTap: () => onSelect(
                   0,
                   260,
-                  1300,
+                  1612,
                   4,
                   false,
                   0,

@@ -17,6 +17,7 @@ use serde_json::Value;
 mod app_controls;
 mod app_runtime;
 mod bypass_policy;
+mod diagnostics;
 mod service_control;
 mod sha256;
 mod subsystem_clocks;
@@ -2231,14 +2232,16 @@ pub fn apply_performance_profile(profile: i32) -> Result<(), String> {
     if accepted {
         Ok(())
     } else {
-        Err(format!(
+        let detail = format!(
             "GPU profile {profile} verify failed: min={} max={} governor={} GED={} policy={}",
             gpu_get_min_freq_mhz(),
             gpu_get_max_freq_mhz(),
             gpu_get_governor(),
             gpu_get_ged_boost(),
             gpu_get_power_policy(),
-        ))
+        );
+        diagnostics::log_event(detail.clone());
+        Err(detail)
     }
 }
 
@@ -4869,6 +4872,7 @@ fn gaming_dynamic_guard() {
     let mut last_written_opp = -1;
     let mut smoothed_load = 0;
     let mut boost_until = Instant::now();
+    let mut last_drift_reassert = Instant::now();
 
     loop {
         let service_gate = service_control::GATE.read().expect("service gate poisoned");
@@ -4892,6 +4896,29 @@ fn gaming_dynamic_guard() {
         let desired_ged_boost = profile_uses_ged_boost(profile);
         if profile >= 0 && !gpu_boost_pipeline_matches(desired_ged_boost) {
             let _ = set_gpu_ged_boost(desired_ged_boost);
+        }
+
+        // The vendor GPU stack keeps reinstating its own clamp while the
+        // display idles: on dash the GED ceiling returns to the stock 338 MHz
+        // index and the devfreq table collapses back to the 598 MHz power
+        // ladder. Only Extreme Beast re-asserted its whole configuration on
+        // every tick; Gaming Dynamic and Battery Saver silently lost theirs,
+        // leaving the Mali ladder pinned at the lowest frequency while the
+        // profile was still reported as active.
+        if matches!(profile, 1 | 2)
+            && !gpu_profile_configured(profile)
+            && last_drift_reassert.elapsed() >= Duration::from_millis(500)
+        {
+            last_drift_reassert = Instant::now();
+            diagnostics::log_event(format!(
+                "gpu profile {profile} drifted (min={} max={} governor={} policy={} dvfs={}); reassert",
+                gpu_get_min_freq_mhz(),
+                gpu_get_max_freq_mhz(),
+                gpu_get_governor(),
+                gpu_get_power_policy(),
+                gpu_get_dvfs_enabled(),
+            ));
+            reassert_gpu_profile_drift(profile);
         }
 
         if !desired_ged_boost {
@@ -5858,6 +5885,87 @@ fn gpu_get_uncap_active() -> i32 {
     }
 }
 
+/// Rewrite the stable half of a profile the vendor stack drifted away from.
+/// The Gaming Dynamic load ramp owns `custom_boost_gpu_freq`, so this never
+/// touches the floor: a mid-game reassert must not throw the ramp away.
+fn reassert_gpu_profile_drift(profile: i32) {
+    let thermal_limited = gpu_get_thermal_state() > 0;
+    match profile {
+        1 => {
+            let _ = service_control::write("/sys/module/ged/parameters/gpu_dvfs_enable", "1");
+            if gpu_get_max_freq_mhz() != 1612
+                && !(thermal_limited && (338..1612).contains(&gpu_get_max_freq_mhz()))
+            {
+                let _ = gpu_write_file(
+                    "/sys/class/devfreq/48000000.mali/max_freq",
+                    "/sys/class/misc/mali0/device/devfreq/48000000.mali/max_freq",
+                    "1612000000",
+                );
+            }
+            if gpu_get_min_freq_mhz() != 338 {
+                let _ = gpu_write_file(
+                    "/sys/class/devfreq/48000000.mali/min_freq",
+                    "/sys/class/misc/mali0/device/devfreq/48000000.mali/min_freq",
+                    "338000000",
+                );
+            }
+            if gpu_get_governor() != "simple_ondemand" {
+                let _ = gpu_write_file(
+                    "/sys/class/devfreq/48000000.mali/governor",
+                    "/sys/class/misc/mali0/device/devfreq/48000000.mali/governor",
+                    "simple_ondemand",
+                );
+            }
+            // The GED ceiling is the clamp the vendor stack keeps reinstating
+            // on this SoC (observed live as `custom_upbound_gpu_freq` sitting
+            // on the 338 MHz stock index); 0 lifts it back out of the way.
+            let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "0");
+            let _ =
+                service_control::write("/sys/class/misc/mali0/device/power_policy", "always_on");
+        }
+        2 => {
+            let _ = service_control::write("/sys/module/ged/parameters/gpu_dvfs_enable", "1");
+            if !(gpu_get_max_freq_mhz() == 598 || (thermal_limited && gpu_get_max_freq_mhz() < 598))
+            {
+                let _ = gpu_write_file(
+                    "/sys/class/devfreq/48000000.mali/max_freq",
+                    "/sys/class/misc/mali0/device/devfreq/48000000.mali/max_freq",
+                    "598000000",
+                );
+            }
+            if gpu_get_min_freq_mhz() != 338 {
+                let _ = gpu_write_file(
+                    "/sys/class/devfreq/48000000.mali/min_freq",
+                    "/sys/class/misc/mali0/device/devfreq/48000000.mali/min_freq",
+                    "338000000",
+                );
+            }
+            if gpu_get_governor() != "powersave" {
+                let _ = gpu_write_file(
+                    "/sys/class/devfreq/48000000.mali/governor",
+                    "/sys/class/misc/mali0/device/devfreq/48000000.mali/governor",
+                    "powersave",
+                );
+            }
+            write_ged_opp_index(
+                "/sys/kernel/ged/hal/custom_boost_gpu_freq",
+                GPU_MIN_FREQ_MHZ,
+                FreqBound::AtLeast,
+            );
+            write_ged_opp_index(
+                "/sys/kernel/ged/hal/custom_upbound_gpu_freq",
+                GPU_BATTERY_CEILING_MHZ,
+                FreqBound::AtMost,
+            );
+            let _ = service_control::write(
+                "/sys/class/misc/mali0/device/power_policy",
+                "coarse_demand",
+            );
+        }
+        _ => {}
+    }
+}
+
 fn gpu_profile_verified(profile: i32) -> bool {
     let min = gpu_get_min_freq_mhz();
     let max = gpu_get_max_freq_mhz();
@@ -5900,14 +6008,31 @@ fn gpu_profile_verified(profile: i32) -> bool {
     }
 }
 
-fn gpu_profile_configured(profile: i32) -> bool {
-    let min = gpu_get_min_freq_mhz();
-    let max = gpu_get_max_freq_mhz();
-    let governor = gpu_get_governor();
-    let dvfs = gpu_get_dvfs_enabled();
-    let power_policy = gpu_get_power_policy();
-    let thermal_limited = gpu_get_thermal_state() > 0;
+/// One snapshot of the GPU readings a profile verdict depends on. Keeping
+/// them in a struct keeps the predicate a pure function over three inputs
+/// (profile, readings, entitlements) rather than a wall of positional args.
+#[derive(Clone, Copy)]
+struct GpuReadings<'a> {
+    min: i32,
+    max: i32,
+    governor: &'a str,
+    dvfs: i32,
+    power_policy: &'a str,
+    cur: i32,
+}
 
+/// Pure predicate over a snapshot of GPU readings. Split from the sysfs
+/// wrapper so drift-guard tests can drive every vendor-reclamp combination
+/// without a Mali device. `cur` only matters for the Beast arm, whose
+/// configured verdict tolerates a clock-gated GPU.
+fn gpu_profile_matches(
+    profile: i32,
+    r: &GpuReadings,
+    thermal_limited: bool,
+    ged_boost: bool,
+) -> bool {
+    let (min, max, governor, dvfs, power_policy, cur) =
+        (r.min, r.max, r.governor, r.dvfs, r.power_policy, r.cur);
     match profile {
         3 => {
             // Static Beast configuration. `gpu_profile_verified` additionally
@@ -5920,19 +6045,19 @@ fn gpu_profile_configured(profile: i32) -> bool {
             // floor and an unfrozen DVFS ladder are only accepted together
             // with a below-target clock, so a genuinely awake GPU must still
             // show the full locked state.
-            let below_target = gpu_get_cur_freq_mhz() < 1612;
+            let below_target = cur < 1612;
             (min == 1612 || below_target)
                 && (dvfs == 0 || below_target)
                 && max == 1612
                 && governor == "performance"
-                && gpu_boost_pipeline_matches(true)
+                && ged_boost
                 && power_policy == "always_on"
         }
         1 => {
             min == 338
                 && (max == 1612 || (thermal_limited && (338..1612).contains(&max)))
                 && governor == "simple_ondemand"
-                && gpu_boost_pipeline_matches(true)
+                && ged_boost
                 && dvfs == 1
                 && power_policy == "always_on"
         }
@@ -5940,17 +6065,31 @@ fn gpu_profile_configured(profile: i32) -> bool {
             min == 338
                 && (max == 598 || (thermal_limited && max < 598))
                 && governor == "powersave"
-                && gpu_boost_pipeline_matches(false)
+                && !ged_boost
                 && dvfs == 1
                 && power_policy == "coarse_demand"
         }
-        _ => {
-            governor == "dummy"
-                && gpu_boost_pipeline_matches(false)
-                && dvfs == 1
-                && power_policy == "coarse_demand"
-        }
+        _ => governor == "dummy" && !ged_boost && dvfs == 1 && power_policy == "coarse_demand",
     }
+}
+
+fn gpu_profile_configured(profile: i32) -> bool {
+    let governor = gpu_get_governor();
+    let power_policy = gpu_get_power_policy();
+    let readings = GpuReadings {
+        min: gpu_get_min_freq_mhz(),
+        max: gpu_get_max_freq_mhz(),
+        governor: &governor,
+        dvfs: gpu_get_dvfs_enabled(),
+        power_policy: &power_policy,
+        cur: gpu_get_cur_freq_mhz(),
+    };
+    gpu_profile_matches(
+        profile,
+        &readings,
+        gpu_get_thermal_state() > 0,
+        gpu_boost_pipeline_matches(profile_uses_ged_boost(profile)),
+    )
 }
 
 /// A profile is in force when it is exactly as requested (`verified`) or when
@@ -7022,6 +7161,16 @@ fn settings_readback_mismatch(cmd: &str) -> Option<String> {
 }
 
 fn dispatch_command(cmd: &str) -> String {
+    let reply = dispatch_command_inner(cmd);
+    let mutation = cmd.starts_with("SET ") || cmd.starts_with("ACTION ");
+    if (mutation || reply.starts_with("ERR")) && cmd != "PING" {
+        let detail: String = reply.chars().take(200).collect();
+        diagnostics::log_event(format!("cmd {cmd} -> {detail}"));
+    }
+    reply
+}
+
+fn dispatch_command_inner(cmd: &str) -> String {
     if subsystem_clocks::is_command(cmd) {
         let _gate = match service_control::GATE.write() {
             Ok(gate) => gate,
@@ -7044,6 +7193,12 @@ fn dispatch_command(cmd: &str) -> String {
             Err(_) => return "ERR service transition lock poisoned".into(),
         };
         return match app_runtime::command(cmd) {
+            Ok(value) => format!("OK {value}"),
+            Err(error) => format!("ERR {error}"),
+        };
+    }
+    if diagnostics::is_command(cmd) {
+        return match diagnostics::command(cmd) {
             Ok(value) => format!("OK {value}"),
             Err(error) => format!("ERR {error}"),
         };
@@ -7463,6 +7618,161 @@ pub fn serve_client(stream: UnixStream) {
 
 #[cfg(test)]
 mod tests {
+    use super::{GpuReadings, gpu_profile_matches};
+
+    fn readings<'a>(
+        min: i32,
+        max: i32,
+        governor: &'a str,
+        dvfs: i32,
+        power_policy: &'a str,
+        cur: i32,
+    ) -> GpuReadings<'a> {
+        GpuReadings {
+            min,
+            max,
+            governor,
+            dvfs,
+            power_policy,
+            cur,
+        }
+    }
+
+    #[test]
+    fn gaming_dynamic_detects_vendor_reclamp() {
+        assert!(gpu_profile_matches(
+            1,
+            &readings(338, 1612, "simple_ondemand", 1, "always_on", 800),
+            false,
+            true
+        ));
+        // The live failure: vendor reinstated its power ladder.
+        assert!(!gpu_profile_matches(
+            1,
+            &readings(338, 598, "powersave", 1, "coarse_demand", 338),
+            false,
+            true
+        ));
+        assert!(!gpu_profile_matches(
+            1,
+            &readings(338, 1612, "powersave", 1, "always_on", 800),
+            false,
+            true
+        ));
+        assert!(!gpu_profile_matches(
+            1,
+            &readings(338, 1612, "simple_ondemand", 1, "coarse_demand", 800),
+            false,
+            true
+        ));
+        assert!(!gpu_profile_matches(
+            1,
+            &readings(338, 1612, "simple_ondemand", 1, "always_on", 800),
+            false,
+            false
+        ));
+        assert!(!gpu_profile_matches(
+            1,
+            &readings(338, 1612, "simple_ondemand", 0, "always_on", 800),
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn gaming_dynamic_respects_thermal_entitlement() {
+        assert!(gpu_profile_matches(
+            1,
+            &readings(338, 1200, "simple_ondemand", 1, "always_on", 1100),
+            true,
+            true
+        ));
+        assert!(!gpu_profile_matches(
+            1,
+            &readings(338, 1200, "simple_ondemand", 1, "always_on", 1100),
+            false,
+            true
+        ));
+        assert!(!gpu_profile_matches(
+            1,
+            &readings(184, 1200, "simple_ondemand", 1, "always_on", 1100),
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn battery_saver_detects_vendor_lift() {
+        assert!(gpu_profile_matches(
+            2,
+            &readings(338, 598, "powersave", 1, "coarse_demand", 338),
+            false,
+            false
+        ));
+        assert!(!gpu_profile_matches(
+            2,
+            &readings(338, 1612, "powersave", 1, "coarse_demand", 900),
+            false,
+            false
+        ));
+        assert!(!gpu_profile_matches(
+            2,
+            &readings(338, 598, "simple_ondemand", 1, "coarse_demand", 338),
+            false,
+            false
+        ));
+        assert!(gpu_profile_matches(
+            2,
+            &readings(338, 500, "powersave", 1, "coarse_demand", 400),
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn extreme_beast_stays_clock_independent() {
+        assert!(gpu_profile_matches(
+            3,
+            &readings(1612, 1612, "performance", 0, "always_on", 1612),
+            false,
+            true
+        ));
+        assert!(gpu_profile_matches(
+            3,
+            &readings(1612, 1612, "performance", 0, "always_on", 1),
+            false,
+            true
+        ));
+        assert!(!gpu_profile_matches(
+            3,
+            &readings(338, 1612, "performance", 0, "always_on", 1612),
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn stock_unchanged_and_unknown_rejected() {
+        assert!(gpu_profile_matches(
+            0,
+            &readings(338, 598, "dummy", 1, "coarse_demand", 338),
+            false,
+            false
+        ));
+        assert!(!gpu_profile_matches(
+            0,
+            &readings(338, 598, "simple_ondemand", 1, "coarse_demand", 338),
+            false,
+            false
+        ));
+        assert!(!gpu_profile_matches(
+            9,
+            &readings(338, 1612, "simple_ondemand", 1, "always_on", 800),
+            false,
+            true
+        ));
+    }
+
     #[test]
     fn fresh_and_partial_settings_leave_touch_and_display_to_rom() {
         for raw in ["", "charging=0\n", "touch=0\ndisplay_temp=0\ndolby=7\n"] {

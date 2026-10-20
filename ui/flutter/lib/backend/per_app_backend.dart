@@ -37,28 +37,26 @@ class PerAppBackend {
         final Map<String, dynamic> reply =
             jsonDecode(raw) as Map<String, dynamic>;
         if (reply['ok'] != true) throw StateError('${reply['error']}');
-        final dynamic data = reply['data'];
-        if (command == 'GET app.list' && data is List) {
-          final String packages = jsonEncode(
-            data.map((dynamic app) => app['package']).toList(),
-          );
-          try {
-            final String rawLabels = await _runLabels(packages);
-            final Map<String, dynamic> labels =
-                jsonDecode(rawLabels) as Map<String, dynamic>;
-            for (final dynamic app in data) {
-              app['label'] = labels[app['package']] ?? app['package'];
-            }
-          } catch (_) {
-            /* Labels are optional; never hide installed apps. */
-          }
-        }
-        result.complete(data);
+        result.complete(reply['data']);
       } catch (error, stack) {
         result.completeError(error, stack);
       }
     });
     return result.future;
+  }
+
+  /// Resolve display labels for a bounded batch of packages. Batched so the
+  /// chooser can enrich the first visible page immediately instead of blocking
+  /// the whole list on one all-packages PackageManager sweep.
+  Future<Map<String, String>> labels(List<String> packages) async {
+    if (packages.isEmpty) return <String, String>{};
+    final String input = jsonEncode(packages.take(40).toList());
+    final String raw = await _runLabels(input);
+    final Map<String, dynamic> reply = jsonDecode(raw) as Map<String, dynamic>;
+    return reply.map(
+      (String package, dynamic label) =>
+          MapEntry<String, String>(package, label as String),
+    );
   }
 
   // Separate capture scopes prevent the queue's Completer from being sent

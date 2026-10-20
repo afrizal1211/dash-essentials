@@ -113,9 +113,13 @@ class _PerAppControlsScreenState extends State<PerAppControlsScreen> {
   bool _showSystem = false;
   bool _forward = true;
   bool _iconsLoading = false;
+  bool _labelsLoading = false;
+  bool _labelsFailed = false;
   final Map<String, Uint8List> _icons = <String, Uint8List>{};
   final Set<String> _iconAttempts = <String>{};
+  final Set<String> _labelAttempts = <String>{};
   Timer? _iconTimer;
+  Timer? _labelTimer;
   Timer? _timer;
   Future<dynamic> _command(String command) =>
       widget.exchange?.call(command) ?? _backend.command(command);
@@ -136,6 +140,7 @@ class _PerAppControlsScreenState extends State<PerAppControlsScreen> {
     _search.addListener(() {
       if (mounted) setState(() => _limit = 40);
       _scheduleIcons();
+      _scheduleLabels();
     });
     unawaited(_load());
     _timer = Timer.periodic(
@@ -149,6 +154,7 @@ class _PerAppControlsScreenState extends State<PerAppControlsScreen> {
     DashNestedBackController.detach(this);
     _timer?.cancel();
     _iconTimer?.cancel();
+    _labelTimer?.cancel();
     _search.dispose();
     super.dispose();
   }
@@ -187,6 +193,7 @@ class _PerAppControlsScreenState extends State<PerAppControlsScreen> {
       if (widget.exchange == null)
         _cachedApps = List<Map<String, dynamic>>.from(_apps);
       _scheduleIcons();
+      _scheduleLabels();
       final dynamic state = await _command('GET app.controls');
       final dynamic caps = await _command('GET app.capabilities');
       if (!mounted) return;
@@ -214,6 +221,11 @@ class _PerAppControlsScreenState extends State<PerAppControlsScreen> {
         .toList();
   }
 
+  /// The rows actually drawn this frame. Labels are only worth resolving for
+  /// what the user can see, so both enrichment passes key off this set.
+  List<Map<String, dynamic>> get _visibleApps =>
+      _filteredApps.take(_limit).toList();
+
   void _scheduleIcons() {
     if (widget.exchange != null) return; // Mock transport has no Android JNI.
     _iconTimer?.cancel();
@@ -222,8 +234,7 @@ class _PerAppControlsScreenState extends State<PerAppControlsScreen> {
 
   Future<void> _loadIcons() async {
     if (!mounted || _iconsLoading) return;
-    final List<String> packages = _filteredApps
-        .take(_limit)
+    final List<String> packages = _visibleApps
         .map((Map<String, dynamic> app) => app['package'] as String)
         .where((String package) => !_iconAttempts.contains(package))
         .take(40)
@@ -243,6 +254,58 @@ class _PerAppControlsScreenState extends State<PerAppControlsScreen> {
     } finally {
       _iconsLoading = false;
       if (mounted) _scheduleIcons();
+    }
+  }
+
+  void _scheduleLabels() {
+    if (widget.exchange != null) return; // Mock transport has no Android JNI.
+    _labelTimer?.cancel();
+    _labelTimer = Timer(const Duration(milliseconds: 40), _loadLabels);
+  }
+
+  /// Enrich the currently visible page with PackageManager labels, one batch at
+  /// a time. The chooser opens on package ids and swaps in names as each batch
+  /// resolves, so typing never waits on the whole installed set. A batch that
+  /// throws is retried once on the next schedule and surfaces a retry hint.
+  Future<void> _loadLabels() async {
+    if (!mounted || _labelsLoading) return;
+    final List<String> packages = _visibleApps
+        .map((Map<String, dynamic> app) => app['package'] as String)
+        .where((String package) => !_labelAttempts.contains(package))
+        .take(40)
+        .toList();
+    if (packages.isEmpty) {
+      if (_labelsFailed && mounted) setState(() => _labelsFailed = false);
+      return;
+    }
+    _labelsLoading = true;
+    _labelAttempts.addAll(packages);
+    try {
+      final Map<String, String> labels = await _backend.labels(packages);
+      if (!mounted) return;
+      setState(() {
+        for (final Map<String, dynamic> app in _apps) {
+          final String? label = labels[app['package']];
+          if (label != null && label.isNotEmpty) app['label'] = label;
+        }
+        _apps.sort(
+          (Map<String, dynamic> a, Map<String, dynamic> b) =>
+              '${a['label'] ?? a['package']}'.toLowerCase().compareTo(
+                '${b['label'] ?? b['package']}'.toLowerCase(),
+              ),
+        );
+        _labelsFailed = false;
+      });
+      if (widget.exchange == null)
+        _cachedApps = List<Map<String, dynamic>>.from(_apps);
+    } catch (_) {
+      // Drop the failed batch from the attempt set so a later schedule (a new
+      // search term, a refresh, a scroll) retries it instead of latching.
+      _labelAttempts.removeAll(packages);
+      if (mounted) setState(() => _labelsFailed = true);
+    } finally {
+      _labelsLoading = false;
+      if (mounted) _scheduleLabels();
     }
   }
 
@@ -510,11 +573,43 @@ class _PerAppControlsScreenState extends State<PerAppControlsScreen> {
               _limit = 40;
             });
             _scheduleIcons();
+            _scheduleLabels();
           },
         ),
-        Text(
-          '${filtered.length} apps · ${_showSystem ? 'Third-party and system' : 'Third-party only'}',
-          style: TextStyle(color: colors.onSurfaceVariant, fontSize: 12),
+        Row(
+          children: <Widget>[
+            Expanded(
+              child: Text(
+                '${filtered.length} apps · ${_showSystem ? 'Third-party and system' : 'Third-party only'}',
+                style: TextStyle(color: colors.onSurfaceVariant, fontSize: 12),
+              ),
+            ),
+            if (_labelsLoading)
+              SizedBox(
+                width: 12,
+                height: 12,
+                child: CircularProgressIndicator(
+                  strokeWidth: 1.6,
+                  color: colors.onSurfaceVariant,
+                ),
+              ),
+            if (_labelsFailed && !_labelsLoading)
+              TextButton(
+                onPressed: () {
+                  _labelAttempts.clear();
+                  _scheduleLabels();
+                },
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 6),
+                  minimumSize: Size.zero,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                child: const Text(
+                  'Retry names',
+                  style: TextStyle(fontSize: 11),
+                ),
+              ),
+          ],
         ),
         const SizedBox(height: 10),
         if (filtered.isNotEmpty)
