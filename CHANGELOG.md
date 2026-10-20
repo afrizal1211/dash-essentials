@@ -106,6 +106,16 @@ original wording.
   alongside the zip and APK so the updater never has to trust a bare
   download.
 
+## 1.18.7
+
+- The port's releases now carry a codename. `Afuri` is the first one: the
+  release tag is `v1.18.7-afuri` and the About screen shows the codename,
+  giving the in-app updater an app-build identity instead of relying on
+  numeric versions alone.
+- The update card says `Your app is up to date.` when the installed module
+  version and the app's codename both match the latest release, and only
+  offers the component that is actually behind (an APK refresh after a
+  module flash, or flashing the module after an APK-only update).
 
 ## 1.18.6
 

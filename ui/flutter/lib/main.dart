@@ -5313,10 +5313,33 @@ class _UpdateCardState extends State<_UpdateCard> {
 
   String get _latestTag => _release?.tag ?? '';
 
+  // A release tag is v<numeral>[-codename]. The numeral matches the installed
+  // module version; the codename suffix matches this app build's identity.
+  static final RegExp _tagShape = RegExp(
+    r'^v([0-9][0-9.]*)(?:-([A-Za-z0-9._-]+))?$',
+  );
+
+  Match? get _tagMatch => _tagShape.firstMatch(_latestTag);
+
+  String? get _latestNumeric => _tagMatch?.group(1);
+
+  String? get _latestCodename => _tagMatch?.group(2)?.toLowerCase();
+
+  String? get _installedNumeric =>
+      _installed?.replaceFirst(RegExp('^v'), '').split('-').first;
+
+  bool get _moduleIsLatest =>
+      _installedNumeric != null && _latestNumeric != null
+          ? _installedNumeric == _latestNumeric
+          : false;
+
+  bool get _appIsLatest =>
+      _latestCodename != null &&
+      _latestCodename == dashReleaseCodename.toLowerCase();
+
   bool get _upToDate =>
-      _installed != null &&
-      _release != null &&
-      _latestTag.replaceFirst('v', '') == _installed;
+      _moduleIsLatest &&
+      (_latestCodename == null || _appIsLatest);
 
   Future<void> _check() async {
     if (_busy) return;
@@ -5470,15 +5493,41 @@ class _UpdateCardState extends State<_UpdateCard> {
                       : 'Installed $_installed',
                   accent: colors.secondary,
                 ),
-                if (_release != null)
+                if (_upToDate)
+                  const StatusPill(
+                    label: 'Your app is up to date',
+                    accent: Color(0xFF41C98A),
+                  )
+                else if (_release != null)
                   StatusPill(
-                    label: _upToDate ? 'Up to date' : 'New $_latestTag',
-                    accent: _upToDate
-                        ? const Color(0xFF41C98A)
-                        : colors.primary,
+                    label: 'New $_latestTag',
+                    accent: colors.primary,
                   ),
               ],
             ),
+            if (_upToDate) ...<Widget>[
+              const SizedBox(height: 10),
+              Row(
+                children: <Widget>[
+                  Icon(
+                    Icons.check_circle_rounded,
+                    size: 15,
+                    color: const Color(0xFF41C98A),
+                  ),
+                  const SizedBox(width: 7),
+                  Expanded(
+                    child: Text(
+                      'Your app is up to date.',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        color: colors.onSurface,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
             if (!_upToDate && (_release?.notes.isNotEmpty ?? false)) ...<Widget>[
               const SizedBox(height: 10),
               Container(
@@ -5504,30 +5553,54 @@ class _UpdateCardState extends State<_UpdateCard> {
               const SizedBox(height: 10),
               Row(
                 children: <Widget>[
-                  Expanded(
-                    child: _UpdateAssetButton(
-                      label: 'Update APK$_sizeLabel(_release!.apkSize)',
-                      busy: _progress > 0.0001 && _progress < 1,
-                      progress: _progress,
-                      icon: Icons.system_update_alt_rounded,
-                      accent: colors.primary,
-                      onTap: () => _apply('apk'),
+                  if (!_appIsLatest)
+                    Expanded(
+                      child: _UpdateAssetButton(
+                        label:
+                            'Update APK${_sizeLabel(_release!.apkSize)}',
+                        busy: _progress > 0.0001 && _progress < 1,
+                        progress: _progress,
+                        icon: Icons.system_update_alt_rounded,
+                        accent: colors.primary,
+                        onTap: () => _apply('apk'),
+                      ),
                     ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: _UpdateAssetButton(
-                      label:
-                          'Flash module$_sizeLabel(_release!.zipSize)',
-                      busy: false,
-                      progress: _progress,
-                      icon: Icons.extension_rounded,
-                      accent: colors.secondary,
-                      onTap: () => _apply('zip'),
+                  if (!_appIsLatest)
+                    const SizedBox(width: 8),
+                  if (!_moduleIsLatest)
+                    Expanded(
+                      child: _UpdateAssetButton(
+                        label:
+                            'Flash module${_sizeLabel(_release!.zipSize)}',
+                        busy: _progress > 0.0001 && _progress < 1,
+                        progress: _progress,
+                        icon: Icons.extension_rounded,
+                        accent: colors.secondary,
+                        onTap: () => _apply('zip'),
+                      ),
                     ),
-                  ),
                 ],
               ),
+              if (!_appIsLatest && _moduleIsLatest) ...<Widget>[
+                const SizedBox(height: 8),
+                Text(
+                  'The module is current — refresh the APK to match.',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: colors.onSurfaceVariant,
+                  ),
+                ),
+              ],
+              if (_appIsLatest && !_moduleIsLatest) ...<Widget>[
+                const SizedBox(height: 8),
+                Text(
+                  'The app is current — flash the module to match.',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: colors.onSurfaceVariant,
+                  ),
+                ),
+              ],
             ],
           ],
           banner,
