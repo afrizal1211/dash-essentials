@@ -1971,39 +1971,98 @@ fn clear_gpu_cooling_cap() {
 }
 
 /// GPUEB firmware limit-table rows that hold the GPU below 1612 MHz on this
-/// SoC. `THERMAL_EB` (id 5) is the stock 1430 MHz ceiling; `THERMAL_AP` (id 4)
-/// is the 338 MHz AP-thermal ceiling. Only `THERMAL_EB` is lifted by the opt-in
-/// unlock: `THERMAL_AP` stays armed as the last-resort thermal floor so an
-/// unlocked device still throttles if the AP thermal engine trips.
+/// SoC, read from `/proc/gpufreqv2/limit_table`:
+///
+/// ```text
+/// [id]  [name]       [priority]  [ceiling]  [floor]  [c_enable]  [f_enable]
+///   4  THERMAL_AP         6          35       -1           1           1
+///   5  THERMAL_EB         6           7       -1           1           1
+///  12  POWERHAL           2           0       51           1           1
+/// ```
+///
+/// The ceiling column is an index into the firmware OPP ladder, not a
+/// frequency: index 7 is the 1430 MHz plateau and index 35 is 1196 MHz, while
+/// the ladder's top (index 0) is 1612 MHz. The firmware takes the strictest
+/// enabled ceiling, and the live `[PPM Ceiling] LimitIndex: 35, Limiter: 4`
+/// line proves `THERMAL_AP` is the row that wins on this device. Lifting only
+/// `THERMAL_EB` therefore leaves a 1196 MHz cap in force, which is why the GPU
+/// ramped but never reached 1612 MHz.
 const GPU_LIMIT_TABLE: &str = "/proc/gpufreqv2/limit_table";
 const GPU_LIMIT_THERMAL_EB: i32 = 5;
 const GPU_LIMIT_THERMAL_AP: i32 = 4;
 
-/// Enable or lift the stock 1430 MHz `THERMAL_EB` ceiling. Format is
-/// `<id> <ceiling_enable> <floor_enable>`; the community GED tuners use the
-/// same node. This does not touch `THERMAL_AP`, the real thermal safety cap.
-fn set_thermal_unlock(enable: bool) -> Result<(), String> {
-    let ceiling_enable = if enable { 0 } else { 1 };
+/// The `THERMAL_EB` ceiling state this process last committed to the GPUEB
+/// firmware: `0` = ceiling lifted, `1` = stock ceiling in force, `-1` =
+/// unknown. The Beast lock loop and the background GPU guard re-assert the
+/// unlock on every tick; this cache keeps the diagnostics log to one line per
+/// transition instead of one per tick.
+static GPU_LIMIT_THERMAL_EB_COMMITTED: AtomicI32 = AtomicI32::new(-1);
+
+/// Commit the GPUEB limit-table rows that own the GPU thermal ceilings.
+/// `THERMAL_EB` (id 5) carries the 1430 MHz EB ceiling and `THERMAL_AP`
+/// (id 4) the 1196 MHz AP ceiling; both are enabled in the stock table and the
+/// firmware takes the strictest of them, so both have to be lifted for the GPU
+/// to reach its 1612 MHz OPP. The rows' floor columns stay enabled: neither
+/// thermal row carries a floor, so the stock 338 MHz power floor is
+/// unaffected.
+fn write_gpu_limit_rows(ceiling_enabled: bool) -> Result<(), String> {
+    let c_enable = if ceiling_enabled { 1 } else { 0 };
     service_control::write(
         GPU_LIMIT_TABLE,
-        format!("{GPU_LIMIT_THERMAL_EB} {ceiling_enable} 1"),
+        format!("{GPU_LIMIT_THERMAL_EB} {c_enable} 1"),
     )
     .map_err(|error| format!("thermal unlock write failed: {error}"))?;
-    // Re-assert THERMAL_AP's ceiling explicitly so a prior unlock run cannot
-    // leave the AP safety cap disabled.
-    service_control::write(GPU_LIMIT_TABLE, format!("{GPU_LIMIT_THERMAL_AP} 1 1"))
-        .map_err(|error| format!("thermal unlock write failed: {error}"))?;
+    service_control::write(
+        GPU_LIMIT_TABLE,
+        format!("{GPU_LIMIT_THERMAL_AP} {c_enable} 1"),
+    )
+    .map_err(|error| format!("thermal unlock write failed: {error}"))?;
+    Ok(())
+}
+
+/// Re-assert the lifted thermal ceilings without touching the persisted state
+/// or the diagnostics log. The vendor stack re-arms the rows behind the
+/// daemon's back, so the background guard repeats this write on a slow
+/// cadence. The persisted opt-in is owned by `set_thermal_unlock` and must not
+/// be rewritten on every guard tick.
+fn reassert_thermal_ceiling_lift() {
+    let _ = write_gpu_limit_rows(false);
+}
+
+/// Re-assert the stock thermal ceilings without touching the persisted state
+/// or the diagnostics log. This is the hardware half of restoring the stock
+/// ceiling; the persisted half belongs to `set_thermal_unlock`.
+fn reassert_thermal_ceiling_stock() {
+    let _ = write_gpu_limit_rows(true);
+}
+
+/// Enable or lift the stock thermal ceilings that hold the GPU below its
+/// 1612 MHz OPP. Format is `<id> <c_enable> <f_enable>`, matching the limit
+/// table's own columns; the community GED tuners use the same node.
+///
+/// This lifts both `THERMAL_EB` and `THERMAL_AP`. `THERMAL_AP` is the row the
+/// firmware actually enforces on this device (the live PPM status names it as
+/// the ceiling limiter), so leaving it armed caps the GPU at 1196 MHz no
+/// matter what the GED and devfreq nodes say. The GPU's own hardware thermal
+/// trip and the platform's CPU thermal zones are untouched by this.
+fn set_thermal_unlock(enable: bool) -> Result<(), String> {
+    write_gpu_limit_rows(!enable)?;
     mutate_persisted_state(|state| {
         state.thermal_unlock = if enable { 1 } else { 0 };
     })?;
     // Field evidence: the limit_table view is a static format string, so the
     // real signal is whether the live thermal ceiling / PPM limiter moves.
-    diagnostics::log_event(format!(
-        "thermal unlock {} thermal_ceiling={}mhz ppm={}",
-        if enable { "on" } else { "off" },
-        gpu_thermal_ceiling_mhz().unwrap_or(-1),
-        gpu_ppm_ceiling_summary(),
-    ));
+    // Only a transition is logged: the Beast lock loop and the background
+    // guard re-assert the unlock many times a second.
+    let committed = i32::from(!enable);
+    if GPU_LIMIT_THERMAL_EB_COMMITTED.swap(committed, Ordering::AcqRel) != committed {
+        diagnostics::log_event(format!(
+            "thermal unlock {} thermal_ceiling={}mhz ppm={}",
+            if enable { "on" } else { "off" },
+            gpu_thermal_ceiling_mhz().unwrap_or(-1),
+            gpu_ppm_ceiling_summary(),
+        ));
+    }
     Ok(())
 }
 
@@ -2026,13 +2085,20 @@ fn profile_uses_ged_boost(profile: i32) -> bool {
 }
 
 fn write_beast_gpu_constraints() {
+    // Lift the stock thermal ceilings (1430 MHz THERMAL_EB, 1196 MHz
+    // THERMAL_AP) so the GPU can reach 1612 MHz. They are independent of the
+    // GED/devfreq nodes and clamp the clock even if every other node is set
+    // for 1612 MHz. This is a hardware only write: the persisted opt-in
+    // belongs to the profile apply and the explicit user toggle, and the Beast
+    // lock loop repeats this every tick.
+    reassert_thermal_ceiling_lift();
+
     let _ = service_control::write("/sys/class/misc/mali0/device/power_policy", "always_on");
     let _ = service_control::write("/sys/kernel/ged/hal/gpu_boost_level", "2");
     let _ = service_control::write("/sys/module/ged/parameters/ged_boost_enable", "1");
     let _ = service_control::write("/sys/module/ged/parameters/boost_gpu_enable", "1");
     let _ = service_control::write("/sys/module/ged/parameters/ged_smart_boost", "1");
-    let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "0");
-    let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "0");
+    let _ = service_control::write(GPU_CEILING_NODE, "0");
     // The `gpu_bottom_freq`/`gpu_cust_*_freq` module parameters are reporting
     // only: ged_dvfs.c assigns them from the OPP it just committed and never
     // reads them back, and no vendor library or binary on Dash references them.
@@ -2053,6 +2119,11 @@ fn write_beast_gpu_constraints() {
         "/sys/class/misc/mali0/device/devfreq/48000000.mali/governor",
         "performance",
     );
+    // The boost target is written last, immediately before it is read back
+    // below. It is the node the vendor stack reclaims, and on this firmware it
+    // is the clock the GPU runs at, so the later the write the smaller the
+    // window in which the stack can put a slow OPP back.
+    let _ = service_control::write(GPU_BOOST_TARGET_NODE, "0");
 }
 
 // Beast must never disable DVFS while the GPU is still running a previous
@@ -2069,23 +2140,34 @@ fn arm_or_lock_beast_gpu() -> bool {
     // reports a low GED OPP, so waiting for `cur == 1612` before freezing left
     // Beast unfrozen until the GPU happened to become busy -- and on this SoC
     // the load governor's steady state sits on the 1430 MHz plateau, so it
-    // never became busy enough to reach 1612. Either the devfreq floor reading
-    // 1612 MHz or GED's own floor index reading 0 (`custom_boost_gpu_freq`,
-    // the fastest OPP) means the GPU cannot drop below 1612 once DVFS freezes.
-    // GED's index is the more durable signal: MediaTek's power service
-    // re-clamps the devfreq floor while the GPU sleeps but leaves the custom
-    // index alone.
-    let floored = gpu_get_min_freq_mhz() >= 1612 || gpu_ged_floor_is_fastest();
-    if gpu_get_cur_freq_mhz() != 1612 && !floored {
+    // never became busy enough to reach 1612.
+    //
+    // GED's boost target has to name the fastest OPP before DVFS is frozen.
+    // It is the clock the GPU runs at, so freezing DVFS while the vendor
+    // stack has reclaimed it pins the GPU to whichever slow OPP the stack
+    // chose -- a devfreq floor of 1612 on its own is not enough, because the
+    // MediaTek power service re-clamps that floor while the GPU sleeps and
+    // because the boost target overrides the floor anyway. The target is also
+    // the more durable signal: the power service re-clamps the devfreq floor
+    // while the GPU sleeps but leaves the custom index alone.
+    let ready = beast_lock_ready(
+        gpu_ged_index(GPU_BOOST_TARGET_NODE),
+        gpu_get_min_freq_mhz(),
+        gpu_get_cur_freq_mhz(),
+    );
+    if !ready {
+        // Re-write the target and try again on the next tick. Leaving DVFS
+        // enabled is deliberate: freezing it on a slow OPP is the failure this
+        // check exists to prevent.
         let _ = service_control::write("/sys/module/ged/parameters/gpu_dvfs_enable", "1");
-        let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "0");
+        let _ = service_control::write(GPU_BOOST_TARGET_NODE, "0");
         return false;
     }
 
     let _ = service_control::write("/sys/module/ged/parameters/gpu_dvfs_enable", "0");
     // Frozen DVFS on a pinned 1612 MHz floor is the lock. The clock itself may
     // read low while the GPU is idle; that is expected and still locked.
-    (floored || gpu_get_cur_freq_mhz() == 1612) && gpu_get_dvfs_enabled() == 0
+    ready && gpu_get_dvfs_enabled() == 0
 }
 
 fn settle_beast_gpu_lock(attempts: usize, delay: Duration) -> bool {
@@ -2109,6 +2191,22 @@ fn settle_beast_gpu_lock(attempts: usize, delay: Duration) -> bool {
 pub fn enforce_performance_profile(profile: i32) -> bool {
     if matches!(profile, 1 | 3) {
         clear_gpu_cooling_cap();
+    }
+    // Every profile that targets the 1612 MHz OPP has to lift the stock MTK
+    // thermal ceilings. `THERMAL_EB` (1430 MHz) and `THERMAL_AP` (1196 MHz) are
+    // firmware limit rows that clamp the GPU independently of the GED and
+    // devfreq nodes, and the firmware enforces the strictest enabled one, so
+    // every other write below is pointless while they are armed. Battery Saver
+    // restores the stock ceilings: it caps the GPU at 598 MHz anyway, and it
+    // is the conservative profile.
+    //
+    // These are hardware only writes. The persisted opt-in belongs to the
+    // global profile apply and to the explicit user toggle, and this path runs
+    // for per-app overrides too, which must never rewrite a global choice.
+    match profile {
+        2 => reassert_thermal_ceiling_stock(),
+        0 | 1 | 3 => reassert_thermal_ceiling_lift(),
+        _ => {}
     }
 
     match profile {
@@ -2143,11 +2241,11 @@ pub fn enforce_performance_profile(profile: i32) -> bool {
             // frequency"). Point the target at index 0 (fastest OPP) so GED
             // boosts to 1612 under load, and let the load ramp move the
             // *ceiling* below to hold clocks back when the GPU is idle.
-            let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "0");
+            let _ = service_control::write(GPU_BOOST_TARGET_NODE, "0");
             // Index 0 is the fastest OPP of every GPUEB ladder, so it needs no
             // table lookup: it lifts this profile's ceiling out of the way. The
             // guard's load ramp lowers it when the GPU is idle.
-            let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "0");
+            let _ = service_control::write(GPU_CEILING_NODE, "0");
             let _ =
                 service_control::write("/sys/class/misc/mali0/device/power_policy", "always_on");
             let _ = service_control::write("/sys/kernel/ged/hal/gpu_boost_level", "1");
@@ -2177,12 +2275,8 @@ pub fn enforce_performance_profile(profile: i32) -> bool {
             // Point GED's boost target at index 0 (fastest) so Battery Saver
             // does not run the GPU at 338 MHz; the 598 MHz ceiling below is the
             // actual limit, through `custom_upbound_gpu_freq` and devfreq max.
-            let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "0");
-            write_ged_opp_index(
-                "/sys/kernel/ged/hal/custom_upbound_gpu_freq",
-                GPU_BATTERY_CEILING_MHZ,
-                FreqBound::AtMost,
-            );
+            let _ = service_control::write(GPU_BOOST_TARGET_NODE, "0");
+            write_ged_opp_index(GPU_CEILING_NODE, GPU_BATTERY_CEILING_MHZ, FreqBound::AtMost);
             let _ = service_control::write(
                 "/sys/class/misc/mali0/device/power_policy",
                 "coarse_demand",
@@ -2214,10 +2308,10 @@ pub fn enforce_performance_profile(profile: i32) -> bool {
             // Point GED's boost target at index 0 (fastest) so Stock is not
             // pinned to 338 MHz. Stock hands live scaling to the vendor power
             // HAL and only needs the full ladder available.
-            let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "0");
+            let _ = service_control::write(GPU_BOOST_TARGET_NODE, "0");
             // Index 0 is the fastest OPP of every GPUEB ladder, so it needs no
             // table lookup: it lifts this profile's ceiling out of the way.
-            let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "0");
+            let _ = service_control::write(GPU_CEILING_NODE, "0");
             let _ = service_control::write(
                 "/sys/class/misc/mali0/device/power_policy",
                 "coarse_demand",
@@ -2253,6 +2347,9 @@ pub fn apply_performance_profile(profile: i32) -> Result<(), String> {
             state.gpu_governor = "performance".to_string();
             state.gpu_power_policy = "always_on".to_string();
             state.gpu_profile_cpu_isolated = 1;
+            // The profile owns the thermal ceiling: the 1612 MHz OPP is only
+            // reachable with the MTK ceiling rows lifted.
+            state.thermal_unlock = 1;
         }),
         1 => mutate_persisted_state(|state| {
             state.perf = 1;
@@ -2264,6 +2361,9 @@ pub fn apply_performance_profile(profile: i32) -> Result<(), String> {
             state.gpu_governor = "simple_ondemand".to_string();
             state.gpu_power_policy = "always_on".to_string();
             state.gpu_profile_cpu_isolated = 1;
+            // The profile owns the thermal ceiling: the 1612 MHz OPP is only
+            // reachable with the MTK ceiling rows lifted.
+            state.thermal_unlock = 1;
         }),
         2 => mutate_persisted_state(|state| {
             state.perf = 2;
@@ -2275,6 +2375,9 @@ pub fn apply_performance_profile(profile: i32) -> Result<(), String> {
             state.gpu_governor = "powersave".to_string();
             state.gpu_power_policy = "coarse_demand".to_string();
             state.gpu_profile_cpu_isolated = 1;
+            // Battery Saver is the conservative profile: it caps the GPU at
+            // 598 MHz on its own, so the stock thermal ceilings go back.
+            state.thermal_unlock = 0;
         }),
         _ => mutate_persisted_state(|state| {
             state.perf = 0;
@@ -2286,6 +2389,9 @@ pub fn apply_performance_profile(profile: i32) -> Result<(), String> {
             state.gpu_governor = "dummy".to_string();
             state.gpu_power_policy = "coarse_demand".to_string();
             state.gpu_profile_cpu_isolated = 1;
+            // Stock Balanced still asks for the 1612 MHz OPP, so it needs the
+            // thermal ceilings lifted as well.
+            state.thermal_unlock = 1;
         }),
     };
     persistence?;
@@ -3188,7 +3294,7 @@ fn touch_profile_apply_lock() -> &'static Mutex<()> {
     TOUCH_PROFILE_APPLY_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct PersistedState {
     charging: i32,
@@ -3781,7 +3887,11 @@ where
         .map_err(|_| "persisted state lock poisoned".to_string())?;
     let mut candidate = guard.clone();
     f(&mut candidate);
-    if !app_runtime::transient_write() {
+    // Skip the flash write when the mutation changed nothing. The background
+    // GPU guard re-applies its state on every tick, and rewriting an
+    // unchanged state file ten times a second wears the storage and adds a
+    // `fsync` to the critical path of every guard tick.
+    if candidate != *guard && !app_runtime::transient_write() {
         save_persisted_state(&candidate)?;
     }
     *guard = candidate;
@@ -4637,7 +4747,9 @@ fn restore_persisted_state() {
         let _ = mutate_persisted_state(|current| {
             if current.perf == persisted.perf {
                 current.gpu_uncap = persisted.gpu_uncap;
-                current.thermal_unlock = persisted.thermal_unlock;
+                // `thermal_unlock` is deliberately not restored here: the
+                // profile apply above owns it, because the profile's OPP
+                // target and the thermal ceiling that holds it have to agree.
                 current.gpu_min_freq_mhz = persisted.gpu_min_freq_mhz;
                 current.gpu_max_freq_mhz = persisted.gpu_max_freq_mhz;
                 current.gpu_ged_boost = persisted.gpu_ged_boost;
@@ -4748,7 +4860,15 @@ fn restore_persisted_state() {
     // -1 means follow OEM/mi_thermald and do not override on boot.
     let _ = restore_saved_thermal_mode();
 
-    if state.thermal_unlock == 1 {
+    // The live persisted flag is read here, not the boot snapshot: the
+    // profile apply above may have changed it, and the profile and the
+    // thermal ceiling it needs have to agree.
+    let thermal_unlock = persisted_state()
+        .lock()
+        .ok()
+        .map(|current| current.thermal_unlock)
+        .unwrap_or(0);
+    if thermal_unlock == 1 {
         let _ = set_thermal_unlock(true);
     }
 
@@ -5003,7 +5123,9 @@ fn gaming_dynamic_guard() {
     let mut smoothed_load = 0;
     let mut boost_until = Instant::now();
     let mut last_drift_reassert = Instant::now();
+    let mut last_target_log = Instant::now();
     let mut last_beast_log = Instant::now();
+    let mut last_thermal_reassert = Instant::now();
 
     loop {
         let service_gate = service_control::GATE.read().expect("service gate poisoned");
@@ -5042,6 +5164,21 @@ fn gaming_dynamic_guard() {
             let _ = set_gpu_ged_boost(desired_ged_boost);
         }
 
+        // The vendor stack can re-arm the MTK thermal limit rows behind the
+        // daemon's back, and those rows clamp the GPU to 1430 MHz
+        // (THERMAL_EB) or 1196 MHz (THERMAL_AP) independently of every GED
+        // and devfreq node below. The profiles that target the 1612 MHz OPP
+        // re-assert the lifted rows on a slow cadence: the firmware reclaims
+        // them within seconds, and one proc write a second is far cheaper
+        // than a profile that silently runs below 1612 MHz while every
+        // readback says it is configured.
+        if matches!(profile, 0 | 1 | 3)
+            && last_thermal_reassert.elapsed() >= Duration::from_millis(1000)
+        {
+            last_thermal_reassert = Instant::now();
+            reassert_thermal_ceiling_lift();
+        }
+
         // The vendor GPU stack keeps reinstating its own clamp while the
         // display idles: on dash the GED ceiling returns to the stock 338 MHz
         // index and the devfreq table collapses back to the 598 MHz power
@@ -5052,10 +5189,35 @@ fn gaming_dynamic_guard() {
         // pipeline (see `gpu_profile_stable_matches`): its master flag is
         // vendor-owned and never matches the disabled expectation, so including
         // it reasserted in an endless loop.
-        if matches!(profile, 1 | 2)
-            && !gpu_profile_stable_matches(profile)
-            && last_drift_reassert.elapsed() >= Duration::from_millis(500)
-        {
+        //
+        // GED's boost target is checked on its own, for every profile that
+        // targets the fastest OPP. That node names the frequency the GPU
+        // actually runs at on this firmware, so a reclaim of it pins the
+        // profile to the 338 MHz floor while every other node still reads as
+        // configured -- the ladder comparison cannot see it. Stock Balanced
+        // needs it too: the vendor power HAL owns the governor and the power
+        // policy there, but the boost target is the profile's own node, and
+        // without the check Balanced would never recover from a reclaim.
+        //
+        // The target is corrected on every tick rather than on the ladder
+        // cadence: the MediaTek power service rewrites the node every couple
+        // of hundred milliseconds, so waiting half a second would leave the
+        // GPU pinned at the 338 MHz floor in between. The write itself is
+        // skipped when the node already holds the target, so a profile that
+        // is not being reclaimed costs one read per tick.
+        if boost_target_drifted(profile, gpu_ged_index(GPU_BOOST_TARGET_NODE)) {
+            reassert_ged_boost_target();
+            if last_target_log.elapsed() >= Duration::from_millis(5000) {
+                last_target_log = Instant::now();
+                diagnostics::log_event(format!(
+                    "gpu profile {profile} boost target reclaimed to index {:?}; reassert",
+                    gpu_ged_index(GPU_BOOST_TARGET_NODE),
+                ));
+            }
+        }
+
+        let ladder_drifted = matches!(profile, 1 | 2) && !gpu_profile_stable_matches(profile);
+        if ladder_drifted && last_drift_reassert.elapsed() >= Duration::from_millis(500) {
             last_drift_reassert = Instant::now();
             diagnostics::log_event(format!(
                 "gpu profile {profile} drifted (min={} max={} governor={} policy={} dvfs={} ged={}); reassert",
@@ -5712,19 +5874,45 @@ fn gpu_ged_index(path: &str) -> Option<i32> {
         .and_then(|first| first.parse::<i32>().ok())
 }
 
-/// Whether GED's boost target (`custom_boost_gpu_freq`) is the fastest OPP,
-/// index 0, i.e. 1612 MHz on this ladder. MediaTek GED treats this node as the
-/// frequency it boosts to, so 0 is simultaneously "target the fastest OPP" and
-/// — with DVFS frozen by Beast — a pinned 1612 MHz. A value that is not 0 (or an
-/// unreadable node) means the target is lower, so Beast is not yet locked.
-fn gpu_ged_floor_is_fastest() -> bool {
-    gpu_ged_index("/sys/kernel/ged/hal/custom_boost_gpu_freq") == Some(0)
+/// Restore GED's boost target to the fastest OPP. The vendor stack reclaims
+/// this node and points it at a slow OPP; on this firmware that is the clock
+/// the GPU runs at, so leaving it reclaimed pins the profile to the 338 MHz
+/// floor. The write is skipped when the node already holds the target, so the
+/// background guard does not hammer the node on every tick. An unreadable
+/// node is left alone: there is no value to restore and a blind write would
+/// only fail.
+fn reassert_ged_boost_target() {
+    if let Some(index) = gpu_ged_index(GPU_BOOST_TARGET_NODE)
+        && index != 0
+    {
+        let _ = service_control::write(GPU_BOOST_TARGET_NODE, "0");
+    }
+}
+
+/// Whether GED's boost target has been reclaimed away from the fastest OPP.
+/// The target is the clock the GPU runs at on this firmware, so a reclaim of
+/// it pins the profile to the 338 MHz floor while every other node still
+/// reads as configured -- a ladder comparison cannot see it. Pure over the
+/// index so it can be tested without a Mali device. An unreadable node is not
+/// drift: there is nothing to compare against and nothing to restore.
+fn boost_target_drifted(profile: i32, boost_target: Option<i32>) -> bool {
+    matches!(profile, 0..=2) && boost_target.is_some_and(|index| index != 0)
+}
+
+/// The Beast lock condition. DVFS may only be frozen once GED's boost target
+/// names the fastest OPP: the target is the clock the GPU runs at, so freezing
+/// DVFS while the vendor stack has reclaimed it pins the GPU to whichever slow
+/// OPP the stack chose. The devfreq floor alone is not enough -- the MediaTek
+/// power service re-clamps that floor while the GPU sleeps. Pure so it can be
+/// tested without a Mali device.
+fn beast_lock_ready(boost_target: Option<i32>, min_mhz: i32, cur_mhz: i32) -> bool {
+    boost_target == Some(0) && (min_mhz >= 1612 || cur_mhz == 1612)
 }
 
 /// The OPP index currently held in GED's upper-bound node
 /// (`custom_upbound_gpu_freq`), or `None` when unreadable.
 fn gpu_ged_ceiling_index() -> Option<i32> {
-    gpu_ged_index("/sys/kernel/ged/hal/custom_upbound_gpu_freq")
+    gpu_ged_index(GPU_CEILING_NODE)
 }
 
 fn gpu_read_raw(path: &str) -> Option<String> {
@@ -5764,6 +5952,14 @@ fn gpu_get_loading() -> i32 {
 /// frequency.
 const GPU_MIN_FREQ_MHZ: i32 = 338;
 const GPU_BATTERY_CEILING_MHZ: i32 = 598;
+
+/// GED's boost target. On this firmware it is the frequency the GPU runs at,
+/// not a floor it may not go below: index 0 is the fastest OPP (1612 MHz) and
+/// any other index runs the clock at that OPP.
+const GPU_BOOST_TARGET_NODE: &str = "/sys/kernel/ged/hal/custom_boost_gpu_freq";
+/// GED's ceiling. Index 0 is the fastest OPP, so it lifts the profile's
+/// ceiling out of the way and the load ramp lowers it when the GPU is idle.
+const GPU_CEILING_NODE: &str = "/sys/kernel/ged/hal/custom_upbound_gpu_freq";
 
 /// Parse a gpufreq v2 table dump. Non-privileged lines look like
 /// `[00] freq: 1612000, volt:  80625, vsram:  80625` and the privileged
@@ -6094,11 +6290,11 @@ fn gpu_get_uncap_active() -> i32 {
 }
 
 /// The MTK thermal framework's live GPU ceiling. `/sys/kernel/thermal/gpu_info`
-/// is `<temp_mC>,<ceiling_hz>,<floor_hz>`; the GPUEB firmware then clamps the
-/// GPU to that ceiling through its `limit_table` (row 5 `THERMAL_EB` is the
-/// default 1430 MHz cap on this SoC). Neither GED nor devfreq writes can beat
-/// it, so Extreme Beast can settle below 1612 even with every node committed.
-/// Returns the ceiling in MHz, or `None` when the node is unavailable.
+/// is `<temp_mC>,<ceiling_hz>,<floor_hz>`. This is the framework's published
+/// policy, not necessarily the cap the GPU is actually held to: the GPUEB
+/// firmware enforces the strictest enabled row of its own limit table, and
+/// that row is the effective ceiling. Returns the published ceiling in MHz, or
+/// `None` when the node is unavailable.
 fn gpu_thermal_ceiling_mhz() -> Option<i32> {
     let raw = gpu_read_raw("/sys/kernel/thermal/gpu_info")?;
     raw.split(',')
@@ -6109,11 +6305,53 @@ fn gpu_thermal_ceiling_mhz() -> Option<i32> {
         .map(|hz| (hz / 1_000_000) as i32)
 }
 
+/// The ceiling the GPUEB firmware is actually enforcing, read from the live
+/// `[PPM Ceiling] LimitIndex: N, Limiter: M` line and resolved through the
+/// firmware OPP ladder. `N` is an index, not a frequency: index 35 is
+/// 1196 MHz, index 7 is 1430 MHz and index 0 is 1612 MHz. This is the number
+/// that explains a "the GPU never reaches 1612 MHz" report, because it names
+/// the row that is holding the clock down.
+fn gpu_ppm_ceiling_mhz() -> Option<i32> {
+    let status = gpu_read_raw("/proc/gpufreqv2/gpufreq_status")?;
+    let index = parse_ppm_ceiling_index(&status)?;
+    let table = live_gpu_opp_table()?;
+    table
+        .iter()
+        .find(|(opp_index, _)| *opp_index == index)
+        .map(|(_, freq_khz)| freq_khz / 1000)
+}
+
+/// Parse the `[PPM Ceiling] LimitIndex: N, Limiter: M, Priority: P` line of
+/// the GPUFREQ status dump. The index names the limit-table row that is
+/// currently enforcing the ceiling, which is the only way to tell a 1196 MHz
+/// AP cap apart from a 1430 MHz EB cap without reading the table itself.
+fn parse_ppm_ceiling_index(status: &str) -> Option<i32> {
+    let line = status.lines().find(|line| line.contains("PPM Ceiling"))?;
+    line.split_whitespace()
+        .skip_while(|token| !token.starts_with("LimitIndex:"))
+        .nth(1)?
+        .trim_end_matches(',')
+        .parse::<i32>()
+        .ok()
+}
+
+/// The effective GPU ceiling: the strictest of the framework's published
+/// ceiling and the firmware's enforced PPM ceiling. This is what the UI shows
+/// and what decides whether a profile that asks for 1612 MHz can reach it.
+fn gpu_effective_ceiling_mhz() -> Option<i32> {
+    match (gpu_thermal_ceiling_mhz(), gpu_ppm_ceiling_mhz()) {
+        (Some(published), Some(enforced)) => Some(published.min(enforced)),
+        (Some(published), None) => Some(published),
+        (None, Some(enforced)) => Some(enforced),
+        (None, None) => None,
+    }
+}
+
 /// Whether the live thermal ceiling is holding the GPU below the 1612 MHz Beast
 /// target. Reported separately from the GED/devfreq state so a field log can
 /// tell a daemon write failure apart from a firmware thermal clamp.
 fn gpu_thermally_capped() -> bool {
-    gpu_thermal_ceiling_mhz().is_some_and(|ceiling| ceiling < 1612)
+    gpu_effective_ceiling_mhz().is_some_and(|ceiling| ceiling < 1612)
 }
 
 /// One-line snapshot of every node Extreme Beast drives, for the field log.
@@ -6142,7 +6380,7 @@ fn beast_gpu_state() -> String {
         .unwrap_or_else(|| "?".into())
     };
     format!(
-        "cur={} min={} max={} gov={} policy={} dvfs={} boost_level={} floor={} ceiling={} ged={} thermal_ceiling={}",
+        "cur={} min={} max={} gov={} policy={} dvfs={} boost_level={} floor={} ceiling={} ged={} thermal_ceiling={} ppm_ceiling={} effective_ceiling={}",
         gpu_get_cur_freq_mhz(),
         gpu_get_min_freq_mhz(),
         gpu_get_max_freq_mhz(),
@@ -6156,6 +6394,12 @@ fn beast_gpu_state() -> String {
         gpu_thermal_ceiling_mhz()
             .map(|mhz| format!("{mhz}MHz"))
             .unwrap_or_else(|| "?".into()),
+        gpu_ppm_ceiling_mhz()
+            .map(|mhz| format!("{mhz}MHz"))
+            .unwrap_or_else(|| "?".into()),
+        gpu_effective_ceiling_mhz()
+            .map(|mhz| format!("{mhz}MHz"))
+            .unwrap_or_else(|| "?".into()),
     )
 }
 
@@ -6167,6 +6411,28 @@ fn beast_gpu_state() -> String {
 fn reassert_gpu_profile_drift(profile: i32) {
     let thermal_limited = gpu_get_thermal_state() > 0;
     match profile {
+        0 => {
+            // Stock Balanced hands the live scaling to the MediaTek power HAL,
+            // so the governor, the power policy and the DVFS gate belong to
+            // the vendor here and are deliberately left alone: reclaiming them
+            // would fight the HAL. What the profile owns is GED's boost
+            // target, and that node is the clock the GPU runs at, so a reclaim
+            // of it is what pins Balanced to the 338 MHz floor.
+            reassert_ged_boost_target();
+            // The devfreq ceiling is the profile's own request as well. The
+            // vendor HAL may lower it while the display idles, but a ceiling
+            // that reads below the request while the GPU is not thermally
+            // limited is the stack reclaiming the ladder, not the HAL.
+            if gpu_get_max_freq_mhz() != 1612
+                && !(thermal_limited && (338..1612).contains(&gpu_get_max_freq_mhz()))
+            {
+                let _ = gpu_write_file(
+                    "/sys/class/devfreq/48000000.mali/max_freq",
+                    "/sys/class/misc/mali0/device/devfreq/48000000.mali/max_freq",
+                    "1612000000",
+                );
+            }
+        }
         1 => {
             let _ = service_control::write("/sys/module/ged/parameters/gpu_dvfs_enable", "1");
             if gpu_get_max_freq_mhz() != 1612
@@ -6197,7 +6463,7 @@ fn reassert_gpu_profile_drift(profile: i32) {
             // load ramp owns `custom_upbound_gpu_freq`, so the ceiling is
             // deliberately not touched: a mid-game reassert must not throw the
             // ramp away.
-            let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "0");
+            reassert_ged_boost_target();
             let _ =
                 service_control::write("/sys/class/misc/mali0/device/power_policy", "always_on");
         }
@@ -6228,12 +6494,8 @@ fn reassert_gpu_profile_drift(profile: i32) {
             // Point the boost target at index 0 instead of 338 MHz: as with
             // Gaming Dynamic, a low index here runs the clock low. Battery
             // Saver's limit is the 598 MHz ceiling, not a 338 MHz boost target.
-            let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "0");
-            write_ged_opp_index(
-                "/sys/kernel/ged/hal/custom_upbound_gpu_freq",
-                GPU_BATTERY_CEILING_MHZ,
-                FreqBound::AtMost,
-            );
+            reassert_ged_boost_target();
+            write_ged_opp_index(GPU_CEILING_NODE, GPU_BATTERY_CEILING_MHZ, FreqBound::AtMost);
             let _ = service_control::write(
                 "/sys/class/misc/mali0/device/power_policy",
                 "coarse_demand",
@@ -6430,10 +6692,10 @@ fn set_gpu_min_freq(mhz: i32) -> Result<(), String> {
     // node is GED's boost target, so any other index runs the GPU low; a
     // requested minimum is expressed through the devfreq floor below, never by
     // lowering this index. This also matches `write_beast_gpu_constraints` and
-    // the Beast lock reader (`gpu_ged_floor_is_fastest`). Resolving 1612 MHz
+    // the Beast lock reader (`beast_lock_ready`). Resolving 1612 MHz
     // through the table would pick index 3 (rows 0-3 all run at 1612 MHz and
     // `AtLeast` chooses the slowest), which the lock reader would reject.
-    let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "0");
+    let _ = service_control::write(GPU_BOOST_TARGET_NODE, "0");
     gpu_write_file(
         "/sys/class/devfreq/48000000.mali/min_freq",
         "/sys/class/misc/mali0/device/devfreq/48000000.mali/min_freq",
@@ -6533,14 +6795,17 @@ fn set_gpu_uncap(enable: bool) -> Result<(), String> {
 
     if enable {
         clear_gpu_cooling_cap();
+        // The Beast lock targets the 1612 MHz OPP, so the stock MTK thermal
+        // ceiling has to be lifted for it to be reachable.
+        let _ = set_thermal_unlock(true);
         beast_locked = settle_beast_gpu_lock(60, Duration::from_millis(25));
     } else {
         service_control::write("/sys/class/misc/mali0/device/power_policy", "coarse_demand")
             .map_err(|error| format!("GPU power policy write failed: {error}"))?;
         // Point GED's boost target at index 0 (fastest) rather than writing the
         // 338 MHz minimum, which this firmware treats as the clock to run.
-        let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "0");
-        let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "0");
+        let _ = service_control::write(GPU_BOOST_TARGET_NODE, "0");
+        let _ = service_control::write(GPU_CEILING_NODE, "0");
         let _ = service_control::write("/sys/kernel/ged/hal/gpu_boost_level", "0");
         gpu_write_file(
             "/sys/class/devfreq/48000000.mali/min_freq",
@@ -6785,8 +7050,13 @@ fn snapshot_persistence_fields() -> Vec<String> {
         format!("gpu_thermal_state={}", gpu_get_thermal_state()),
         format!(
             "gpu_thermal_ceiling={}",
+            gpu_effective_ceiling_mhz().unwrap_or(-1)
+        ),
+        format!(
+            "gpu_thermal_published_ceiling={}",
             gpu_thermal_ceiling_mhz().unwrap_or(-1)
         ),
+        format!("gpu_ppm_ceiling={}", gpu_ppm_ceiling_mhz().unwrap_or(-1)),
         format!("gpu_thermally_capped={}", i32::from(gpu_thermally_capped())),
         format!("gpu_thermal_unlock={}", state.thermal_unlock),
         format!("gpu_uncap_active={}", gpu_get_uncap_active()),
@@ -7965,8 +8235,9 @@ pub fn serve_client(stream: UnixStream) {
 #[cfg(test)]
 mod tests {
     use super::{
-        GPU_UNCAPPED_ARMED, GpuReadings, gpu_profile_matches, gpu_profile_matches_reading,
-        gpu_uncap_armed, per_app_gpu_override_active, set_per_app_gpu_override,
+        GPU_UNCAPPED_ARMED, GpuReadings, beast_lock_ready, boost_target_drifted,
+        gpu_profile_matches, gpu_profile_matches_reading, gpu_uncap_armed, parse_ppm_ceiling_index,
+        per_app_gpu_override_active, set_per_app_gpu_override,
     };
 
     fn readings<'a>(
@@ -8148,6 +8419,37 @@ mod tests {
         assert!(gpu_profile_matches_reading(1, &target, false, None));
         // GED pipeline mismatch alone is not drift for the periodic guard.
         assert!(!gpu_profile_matches_reading(1, &target, false, Some(false)));
+    }
+
+    #[test]
+    fn a_reclaimed_boost_target_is_drift_for_every_opp_profile() {
+        // Live field failure: the vendor stack reclaimed GED's boost target
+        // and pointed it at a slow OPP. On this firmware the target is the
+        // clock the GPU runs at, so the profile sat at the 338 MHz floor while
+        // every ladder readback still looked configured. The ladder comparison
+        // cannot see it, so the target is checked on its own.
+        for profile in 0..=2 {
+            assert!(boost_target_drifted(profile, Some(4)));
+            assert!(!boost_target_drifted(profile, Some(0)));
+        }
+        // An unreadable node is not drift: there is no value to restore.
+        assert!(!boost_target_drifted(1, None));
+        // Extreme Beast re-asserts the whole node set on every tick, so it is
+        // not part of the target drift check.
+        assert!(!boost_target_drifted(3, Some(4)));
+    }
+
+    #[test]
+    fn beast_only_freezes_dvfs_on_the_fastest_boost_target() {
+        // Freezing DVFS while the vendor stack holds a slow boost target
+        // pins the GPU to that slow OPP. A 1612 MHz devfreq floor is not
+        // enough on its own: the MediaTek power service re-clamps the floor
+        // while the GPU sleeps.
+        assert!(beast_lock_ready(Some(0), 1612, 338));
+        assert!(beast_lock_ready(Some(0), 338, 1612));
+        assert!(!beast_lock_ready(Some(4), 1612, 1612));
+        assert!(!beast_lock_ready(None, 1612, 1612));
+        assert!(!beast_lock_ready(Some(0), 338, 338));
     }
 
     #[test]
@@ -8384,6 +8686,42 @@ io.github.neeschal.dashessential 10228 0 /data/user/0/io.github.neeschal.dashess
         assert_eq!(cpu_frequency_drift_status(-1, -1, 300, 2100), -1);
         assert_eq!(cpu_frequency_drift_status(1200, 1800, 1200, 1800), 0);
         assert_eq!(cpu_frequency_drift_status(1800, 1800, 1200, 1800), 1);
+    }
+
+    #[test]
+    fn parses_the_ppm_ceiling_limit_index_from_the_status_dump() {
+        // The live dump on Dash names the row that is actually enforcing the
+        // ceiling. `LimitIndex: 35, Limiter: 4` is THERMAL_AP at 1196 MHz --
+        // the cap that survived a THERMAL_EB-only unlock and kept the GPU
+        // below 1612 MHz.
+        let status = "[GPUFREQ-DEBUG] Current Status of GPUFREQ\n\
+[GPU   OPP]      Index: 51, Freq:   26000, Volt:  49375, Vsram:  75000\n\
+[PPM Ceiling]    LimitIndex: 35, Limiter:  4, Priority:  6\n\
+[PPM Floor]      LimitIndex: 51, Limiter:  0, Priority:  9\n";
+        assert_eq!(parse_ppm_ceiling_index(status), Some(35));
+        // The floor line must not be mistaken for the ceiling line.
+        assert_eq!(
+            parse_ppm_ceiling_index("[PPM Floor] LimitIndex: 51, Limiter: 0\n"),
+            None
+        );
+        assert_eq!(parse_ppm_ceiling_index("no status here"), None);
+    }
+
+    #[test]
+    fn resolves_the_ppm_ceiling_index_to_a_frequency() {
+        // Index 35 is the 1196 MHz plateau and index 7 the 1430 MHz one on
+        // Dash's 52 entry ladder. Both are below the 1612 MHz target, which
+        // is why the GPU ramped but never reached the top OPP.
+        let table = dash_working_opp_table();
+        let resolve = |index: i32| {
+            table
+                .iter()
+                .find(|(opp_index, _)| *opp_index == index)
+                .map(|(_, freq_khz)| freq_khz / 1000)
+        };
+        assert_eq!(resolve(35), Some(1196));
+        assert_eq!(resolve(7), Some(1430));
+        assert_eq!(resolve(0), Some(1612));
     }
 
     #[test]

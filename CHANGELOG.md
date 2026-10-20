@@ -106,6 +106,45 @@ original wording.
   alongside the zip and APK so the updater never has to trust a bare
   download.
 
+## 1.18.13
+
+Codename: Lyra.
+
+- The GPU now reaches its 1612 MHz OPP. Two separate firmware clamps were
+  holding it back and neither was fully lifted before.
+  - The MediaTek GPUFREQ limit table carries **two** thermal ceiling rows, and
+    the firmware enforces the strictest enabled one. `THERMAL_EB` caps at
+    1430 MHz and `THERMAL_AP` at 1196 MHz, and the live status line named
+    `THERMAL_AP` (`LimitIndex: 35, Limiter: 4`) as the row actually in force.
+    The unlock lifted `THERMAL_EB` only and then re-armed `THERMAL_AP`, so a
+    1196 MHz cap stayed in place and the GPU ramped but never reached 1612 MHz.
+    Both rows are now lifted together, and the stock ceilings come back with
+    Battery Saver, the conservative profile.
+  - The MediaTek power service continuously rewrites GED's boost target
+    (`custom_boost_gpu_freq`) to index 51, the 338 MHz floor, and on this
+    firmware that node is the clock the GPU actually runs at. The background
+    guard now watches the boost target on its own and restores it to the
+    fastest OPP as soon as the vendor reclaims it. Stock Balanced is included:
+    the vendor power HAL owns the governor and the power policy there, but the
+    boost target belongs to the profile, and without the check Balanced could
+    never recover from a reclaim. Extreme Beast also refuses to freeze DVFS
+    while the target names a slow OPP, because freezing it there would pin the
+    GPU to that OPP.
+- The thermal ceiling readback now reports the ceiling the firmware is really
+  enforcing. The live `[PPM Ceiling]` limit index is resolved through the
+  firmware OPP ladder and combined with the platform's published ceiling, so
+  the diagnostics screen and the "thermally capped" notice name the real cap
+  (1196 MHz or 1430 MHz) instead of a value that does not match what the GPU
+  is held to.
+- The daemon no longer rewrites its state file ten times a second. The GPU
+  guard re-applied its state on every tick, and each write did two `fsync`
+  calls, which put twenty flash syncs per second on the device's storage for
+  no change at all. A state mutation that changes nothing is now skipped, and
+  the thermal unlock is logged only when it actually transitions.
+- The in-app thermal ceiling notice and toast now describe what the unlock
+  really does: both GPU thermal ceiling rows are lifted, so the clock is only
+  limited by the cooling available.
+
 ## 1.18.12
 
 Codename: Astraea.

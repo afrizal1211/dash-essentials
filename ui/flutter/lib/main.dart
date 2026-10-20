@@ -12635,7 +12635,7 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
     _showGlassToast(
       'THERMAL CEILING',
       enabled
-          ? 'Raised MTK GPU ceiling · AP safety cap stays on'
+          ? 'Raised MTK GPU ceiling · both thermal rows lifted'
           : 'Restored MTK stock GPU ceiling',
       enabled ? Icons.lock_open_rounded : Icons.lock_rounded,
       enabled ? const Color(0xFFFFB84D) : const Color(0xFF67C2FF),
@@ -12908,9 +12908,11 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
     );
   }
 
-  // THERMAL CEILING NOTICE: the MTK thermal framework clamps the GPU below the
-  // Beast target on this SoC (stock THERMAL_EB ceiling is 1430 MHz). Surface it
-  // honestly and offer the opt-in unlock instead of pretending 1612 is live.
+  // THERMAL CEILING NOTICE: the MediaTek GPUFREQ firmware clamps the GPU
+  // below the Beast target on this SoC. Two rows of its limit table do it:
+  // THERMAL_EB caps at 1430 MHz and THERMAL_AP at 1196 MHz, and the firmware
+  // enforces the strictest enabled one. Surface it honestly and offer the
+  // opt-in unlock instead of pretending 1612 is live.
   Widget _buildThermalCapNotice({
     required bool isDark,
     required ColorScheme colors,
@@ -12942,10 +12944,10 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
           ),
           const SizedBox(height: 6),
           Text(
-            "MediaTek's thermal firmware is holding the Mali ceiling below "
-            'Extreme Beast\'s 1.61 GHz target. The AP safety cap stays armed; '
-            'only the stock 1430 MHz ceiling is lifted. Use only with active '
-            'cooling.',
+            "MediaTek's GPUFREQ firmware is holding the Mali ceiling below "
+            'Extreme Beast\'s 1.61 GHz target. Unlocking lifts both GPU '
+            'thermal ceiling rows, so the clock is only limited by the '
+            'cooling you have. Use only with active cooling.',
             style: TextStyle(fontSize: 12.5, color: colors.onSurfaceVariant),
           ),
           const SizedBox(height: 10),
