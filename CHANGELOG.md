@@ -106,6 +106,29 @@ original wording.
   alongside the zip and APK so the updater never has to trust a bare
   download.
 
+## 1.18.9
+
+Codename: Hoshi.
+
+- Gaming Dynamic and Battery Saver stop reasserting in a loop. The periodic
+  drift guard compared the full profile including the GED boost pipeline, but
+  the vendor GED worker owns that master switch and keeps it on, so the check
+  never settled and rewrote the profile every 500 ms forever. The guard now
+  compares only the nodes the vendor stack actually reclaims — devfreq ceiling
+  and floor, governor, power policy, DVFS gate — and logs the GED pipeline
+  state alongside the drifted readings so the two can never be confused again.
+- A Beast GPU restore that is armed but not yet locked no longer blocks the
+  profile controls. When Extreme Beast is applied on an idle GPU the OPP is
+  written and persisted but cannot be read back until the GPU wakes; this
+  "armed" reply was treated as a hard per-app restore failure, leaving the
+  control stuck in a restoring state that rejected every later profile change
+  with a phantom "still restoring this control" error. An armed Beast restore
+  now counts as complete and locks the moment the GPU becomes active.
+- Leaving Extreme Beast for Gaming Dynamic restores the load ramp. The
+  performance governor Beast leaves behind is now detected as drift and
+  rewritten to `simple_ondemand`, so Gaming Dynamic resumes scaling instead of
+  staying pinned.
+
 ## 1.18.8
 
 Codename: Sakura.

@@ -430,7 +430,17 @@ impl Hardware for Adapter {
                         set_gpu_power_policy(&saved.state.gpu_power_policy)?;
                     }
                     if saved.state.gpu_uncap == 1 {
-                        set_gpu_uncap(true)?;
+                        // An armed-but-clock-gated Beast lock is a completed
+                        // restore: the writes and persisted state are in place
+                        // and the OPP locks when the GPU wakes. Treating it as
+                        // a failure left the owner in RecoveryRequired and
+                        // rejected every later `SET perf` with a phantom
+                        // "still restoring" error.
+                        if let Err(error) = set_gpu_uncap(true)
+                            && !gpu_uncap_armed(&error)
+                        {
+                            return Err(error);
+                        }
                     }
                 }
                 Control::CpuRange(p) => {

@@ -4904,19 +4904,23 @@ fn gaming_dynamic_guard() {
         // ladder. Only Extreme Beast re-asserted its whole configuration on
         // every tick; Gaming Dynamic and Battery Saver silently lost theirs,
         // leaving the Mali ladder pinned at the lowest frequency while the
-        // profile was still reported as active.
+        // profile was still reported as active. The comparison ignores the GED
+        // pipeline (see `gpu_profile_stable_matches`): its master flag is
+        // vendor-owned and never matches the disabled expectation, so including
+        // it reasserted in an endless loop.
         if matches!(profile, 1 | 2)
-            && !gpu_profile_configured(profile)
+            && !gpu_profile_stable_matches(profile)
             && last_drift_reassert.elapsed() >= Duration::from_millis(500)
         {
             last_drift_reassert = Instant::now();
             diagnostics::log_event(format!(
-                "gpu profile {profile} drifted (min={} max={} governor={} policy={} dvfs={}); reassert",
+                "gpu profile {profile} drifted (min={} max={} governor={} policy={} dvfs={} ged={}); reassert",
                 gpu_get_min_freq_mhz(),
                 gpu_get_max_freq_mhz(),
                 gpu_get_governor(),
                 gpu_get_power_policy(),
                 gpu_get_dvfs_enabled(),
+                gpu_get_ged_boost(),
             ));
             reassert_gpu_profile_drift(profile);
         }
@@ -6024,15 +6028,19 @@ struct GpuReadings<'a> {
 /// Pure predicate over a snapshot of GPU readings. Split from the sysfs
 /// wrapper so drift-guard tests can drive every vendor-reclamp combination
 /// without a Mali device. `cur` only matters for the Beast arm, whose
-/// configured verdict tolerates a clock-gated GPU.
-fn gpu_profile_matches(
+/// configured verdict tolerates a clock-gated GPU. `ged_boost` is the live GED
+/// pipeline state; `None` skips the GED arm entirely so the background drift
+/// guard can compare only the nodes the vendor stack reclaims.
+fn gpu_profile_matches_reading(
     profile: i32,
     r: &GpuReadings,
     thermal_limited: bool,
-    ged_boost: bool,
+    ged_boost: Option<bool>,
 ) -> bool {
     let (min, max, governor, dvfs, power_policy, cur) =
         (r.min, r.max, r.governor, r.dvfs, r.power_policy, r.cur);
+    // Absent from the comparison, the GED arm is treated as satisfied.
+    let ged_ok = |expected: bool| ged_boost.is_none_or(|live| live == expected);
     match profile {
         3 => {
             // Static Beast configuration. `gpu_profile_verified` additionally
@@ -6050,14 +6058,14 @@ fn gpu_profile_matches(
                 && (dvfs == 0 || below_target)
                 && max == 1612
                 && governor == "performance"
-                && ged_boost
+                && ged_ok(true)
                 && power_policy == "always_on"
         }
         1 => {
             min == 338
                 && (max == 1612 || (thermal_limited && (338..1612).contains(&max)))
                 && governor == "simple_ondemand"
-                && ged_boost
+                && ged_ok(true)
                 && dvfs == 1
                 && power_policy == "always_on"
         }
@@ -6065,12 +6073,21 @@ fn gpu_profile_matches(
             min == 338
                 && (max == 598 || (thermal_limited && max < 598))
                 && governor == "powersave"
-                && !ged_boost
+                && ged_ok(false)
                 && dvfs == 1
                 && power_policy == "coarse_demand"
         }
-        _ => governor == "dummy" && !ged_boost && dvfs == 1 && power_policy == "coarse_demand",
+        _ => governor == "dummy" && ged_ok(false) && dvfs == 1 && power_policy == "coarse_demand",
     }
+}
+
+fn gpu_profile_matches(
+    profile: i32,
+    r: &GpuReadings,
+    thermal_limited: bool,
+    ged_boost: bool,
+) -> bool {
+    gpu_profile_matches_reading(profile, r, thermal_limited, Some(ged_boost))
 }
 
 fn gpu_profile_configured(profile: i32) -> bool {
@@ -6090,6 +6107,28 @@ fn gpu_profile_configured(profile: i32) -> bool {
         gpu_get_thermal_state() > 0,
         gpu_boost_pipeline_matches(profile_uses_ged_boost(profile)),
     )
+}
+
+/// The subset of a profile the vendor GPU stack is known to reclaim on its
+/// own (frequency ladder, governor, power policy, DVFS gate). The background
+/// guard reasserts on this and only this: the GED boost pipeline is written
+/// once by the apply path, and one of its flags is the always-on GED master
+/// switch that the vendor worker owns. Comparing it every tick made profiles
+/// 1 and 2 read as "drifted" forever and reassert in a loop, since the master
+/// flag never matches the disabled expectation. Post-apply verification still
+/// uses the full `gpu_profile_matches` with the GED pipeline included.
+fn gpu_profile_stable_matches(profile: i32) -> bool {
+    let governor = gpu_get_governor();
+    let power_policy = gpu_get_power_policy();
+    let readings = GpuReadings {
+        min: gpu_get_min_freq_mhz(),
+        max: gpu_get_max_freq_mhz(),
+        governor: &governor,
+        dvfs: gpu_get_dvfs_enabled(),
+        power_policy: &power_policy,
+        cur: gpu_get_cur_freq_mhz(),
+    };
+    gpu_profile_matches_reading(profile, &readings, gpu_get_thermal_state() > 0, None)
 }
 
 /// A profile is in force when it is exactly as requested (`verified`) or when
@@ -6195,6 +6234,18 @@ fn set_gpu_ged_boost(enable: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// The Extreme Beast OPP is committed while the GPU is clock-gated: the
+/// devfreq floor, GED ceiling and lock are written and persisted, but the live
+/// OPP cannot be read back until the GPU wakes. Callers treat this as success —
+/// the profile locks the moment the GPU becomes active — so a per-app restore
+/// that returns it must not leave the owner stuck in `RecoveryRequired`.
+pub(crate) const GPU_UNCAPPED_ARMED: &str =
+    "Beast OPP 0 is armed and will lock when the GPU becomes active";
+
+pub(crate) fn gpu_uncap_armed(error: &str) -> bool {
+    error == GPU_UNCAPPED_ARMED
+}
+
 fn set_gpu_uncap(enable: bool) -> Result<(), String> {
     let mut beast_locked = true;
 
@@ -6260,7 +6311,7 @@ fn set_gpu_uncap(enable: bool) -> Result<(), String> {
     })?;
 
     if enable && !beast_locked {
-        Err("Beast OPP 0 is armed and will lock when the GPU becomes active".into())
+        Err(GPU_UNCAPPED_ARMED.into())
     } else {
         Ok(())
     }
@@ -7618,7 +7669,10 @@ pub fn serve_client(stream: UnixStream) {
 
 #[cfg(test)]
 mod tests {
-    use super::{GpuReadings, gpu_profile_matches};
+    use super::{
+        GPU_UNCAPPED_ARMED, GpuReadings, gpu_profile_matches, gpu_profile_matches_reading,
+        gpu_uncap_armed,
+    };
 
     fn readings<'a>(
         min: i32,
@@ -7771,6 +7825,41 @@ mod tests {
             false,
             true
         ));
+    }
+
+    #[test]
+    fn drift_comparison_ignores_the_vendor_ged_master_flag() {
+        // Live failure from the field logs: the vendor GED master switch is
+        // always on, so a pipeline comparison made profile 2 look drifted
+        // forever even with every node at target. Skipping the GED arm must
+        // accept it.
+        let stable = readings(338, 598, "powersave", 1, "coarse_demand", 338);
+        assert!(gpu_profile_matches_reading(2, &stable, false, None));
+        // With the GED arm asserted the full predicate rejects (profile 2 wants
+        // it off), which is precisely why the guard must pass `None`.
+        assert!(!gpu_profile_matches_reading(2, &stable, false, Some(true)));
+        // A real node drift is still caught.
+        let drifted = readings(338, 1612, "powersave", 1, "coarse_demand", 900);
+        assert!(!gpu_profile_matches_reading(2, &drifted, false, None));
+    }
+
+    #[test]
+    fn gaming_dynamic_stable_ignores_ged_but_detects_governor_residue() {
+        // Beast's performance governor left behind is drift, and the GED arm
+        // must not mask it.
+        let residue = readings(338, 1612, "performance", 1, "always_on", 800);
+        assert!(!gpu_profile_matches_reading(1, &residue, false, None));
+        let target = readings(338, 1612, "simple_ondemand", 1, "always_on", 800);
+        assert!(gpu_profile_matches_reading(1, &target, false, None));
+        // GED pipeline mismatch alone is not drift for the periodic guard.
+        assert!(!gpu_profile_matches_reading(1, &target, false, Some(false)));
+    }
+
+    #[test]
+    fn armed_beast_restore_is_recognised_as_complete() {
+        assert!(gpu_uncap_armed(GPU_UNCAPPED_ARMED));
+        assert!(!gpu_uncap_armed("GPU dynamic-state reset did not verify"));
+        assert!(!gpu_uncap_armed(""));
     }
 
     #[test]
