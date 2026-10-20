@@ -28,6 +28,11 @@ name: Dash Essential module
 # DASH_DEV_KEYSTORE_BASE64 secret (alias `dash-essential-development`, store and
 # key password `android`) to keep one stable development signature across runs
 # so `adb install -r` style updates keep working.
+#
+# Announcements. A published release is posted to the project's Telegram channel
+# when the optional TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID secrets are set (the
+# bot must be an admin of the target channel). Without them the announcement is
+# skipped and the build still succeeds.
 
 on:
   workflow_dispatch:
@@ -263,4 +268,44 @@ jobs:
               --notes-file "$RUNNER_TEMP/notes.md" \
               "${zip[@]}" "${sum[@]}" "${apk[@]}" "${apk[0]}.sha256"
           fi
+
+      # Announce the release to the project's Telegram channel. This runs the
+      # same way the release does: only for a signed v* tag, never for a
+      # development build. The secrets are optional, so a fork or a repository
+      # without them skips the announcement instead of failing the build.
+      - name: Announce on Telegram
+        if: startsWith(github.ref, 'refs/tags/v') && env.DASH_ALLOW_UNOFFICIAL_SIGNING == '0'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "Telegram secrets are not configured; skipping announcement" >&2
+            exit 0
+          fi
+
+          version="${GITHUB_REF_NAME#v}"
+          body="$(awk -v want="$version" '
+            $0 == "## " want {inside=1; next}
+            inside && /^## / {exit}
+            inside {print}
+          ' CHANGELOG.md)"
+          release_url="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}"
+
+          {
+            printf 'Dash Essential %s is out.\n' "$GITHUB_REF_NAME"
+            if [ -n "$body" ]; then
+              printf '\n%s\n' "$body"
+            fi
+            printf '\n%s\n' "$release_url"
+          } > "$RUNNER_TEMP/telegram.txt"
+
+          curl -fsS --retry 3 \
+            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text@$RUNNER_TEMP/telegram.txt" \
+            --data-urlencode "disable_web_page_preview=false" >/dev/null
+          echo "Announced $GITHUB_REF_NAME on Telegram"
 
