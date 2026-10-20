@@ -91,6 +91,20 @@ original wording.
   floor and DVFS are only accepted together with a below-target clock
   committed, so GPU waking must still show the full locked state; the
   background GPU guard reasserts the floor until the ladder commits 1612.
+- A fresh sakura launcher icon replaces the inherited upstream emblem:
+  an original pink-gradient squircle with the Dash monogram, redrawn at
+  every launcher density (nothing from ArchiveTune is reused).
+- In-app updates. The app fetches the latest GitHub release, downloads the
+  APK or driver-module zip into its cache, and verifies it against the
+  release's `*.sha256` asset (a pure-Dart SHA-256 that the root daemon
+  re-verifies independently before acting). Commands `SET update.install_apk
+  <path> <sha256>` install through `cmd package install -r`, and
+  `SET update.flash_module <path> <sha256>` stages the zip under
+  `/data/adb/dash-essential/update` and flashes it via `ksud` or Magisk;
+  both refuse any path outside the app cache allowlist and refuse missing
+  or malformed checksums. CI now publishes `Dash-Essential.apk.sha256`
+  alongside the zip and APK so the updater never has to trust a bare
+  download.
 
 
 ## 1.18.6

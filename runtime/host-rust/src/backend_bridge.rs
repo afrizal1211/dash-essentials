@@ -505,14 +505,24 @@ pub unsafe extern "C" fn dash_backend_app_controls_exchange(
         || command.starts_with("ACTION subsystem.clocks.level storage ")
         || command.starts_with("ACTION subsystem.clocks.range memory ")
         || command.starts_with("ACTION subsystem.clocks.range storage ")
-        || command == "ACTION subsystem.clocks.trial storage")
+        || command == "ACTION subsystem.clocks.trial storage"
+        || command == "GET update.status"
+        || command.starts_with("SET update.install_apk ")
+        || command.starts_with("SET update.flash_module "))
     {
         return -1;
     }
     let exchange = (|| -> Result<serde_json::Value, String> {
         let mut stream = connect_daemon()?;
+        // Package installs and module flashes legitimately exceed the
+        // telemetry deadline; give the staged update transactions room.
+        let deadline = if command.starts_with("SET update.") {
+            Duration::from_secs(600)
+        } else {
+            Duration::from_secs(20)
+        };
         stream
-            .set_response_timeout(Duration::from_secs(20))
+            .set_response_timeout(deadline)
             .map_err(|e| e.to_string())?;
         stream
             .write_all(format!("@{}\n{}", command.len(), command).as_bytes())

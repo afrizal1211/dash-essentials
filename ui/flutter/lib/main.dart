@@ -20,6 +20,7 @@ import 'motion_diagnostics.dart';
 
 import 'backend/dash_backend.dart';
 import 'backend/per_app_backend.dart';
+import 'backend/update_service.dart';
 import 'backend/bypass_telemetry.dart';
 import 'bypass_threshold_selector.dart';
 import 'backend/system_colors_library.dart';
@@ -5226,6 +5227,11 @@ class SupportScreen extends StatelessWidget {
           accent: const Color(0xFF26A5E4),
           onTap: () => _openLink(1),
         ),
+        const SizedBox(height: 16),
+        const SectionLabel('App & Module Updates'),
+        const SizedBox(height: 8),
+        const _UpdateCard(),
+
         const SizedBox(height: 8),
 
         // Upstream source Card
@@ -5286,6 +5292,312 @@ class SupportScreen extends StatelessWidget {
         ),
         const SizedBox(height: 10),
       ],
+    );
+  }
+}
+
+
+class _UpdateCard extends StatefulWidget {
+  const _UpdateCard();
+
+  @override
+  State<_UpdateCard> createState() => _UpdateCardState();
+}
+
+class _UpdateCardState extends State<_UpdateCard> {
+  UpdateRelease? _release;
+  String? _installed;
+  String? _error;
+  bool _busy = false;
+  double _progress = 0;
+
+  String get _latestTag => _release?.tag ?? '';
+
+  bool get _upToDate =>
+      _installed != null &&
+      _release != null &&
+      _latestTag.replaceFirst('v', '') == _installed;
+
+  Future<void> _check() async {
+    if (_busy) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+      _installed = null;
+      _release = null;
+    });
+    try {
+      final status = await PerAppBackend.instance.command('GET update.status');
+      final module = (status is Map ? status['module'] : null) as String?;
+      final release = await UpdateService.latest();
+      if (!mounted) return;
+      setState(() {
+        _installed = module;
+        _release = release;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _error = error.toString().replaceFirst('Bad state: ', '');
+      });
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _apply(String kind) async {
+    final release = _release;
+    if (release == null || _busy || _progress > 0) return;
+    final isApk = kind == 'apk';
+    final expected = isApk ? release.apkSha256 : release.zipSha256;
+    final staged =
+        '${Directory.systemTemp.path}/'
+        '${isApk ? 'dash-update.apk' : 'dash-update.zip'}';
+    try {
+      final stale = File(staged);
+      if (stale.existsSync()) stale.deleteSync();
+      setState(() {
+        _busy = true;
+        _progress = 0.0001;
+        _error = null;
+      });
+      await UpdateService.download(
+        isApk ? release.apkUrl : release.zipUrl,
+        staged,
+        (double p) => setState(() => _progress = p),
+      );
+      setState(() => _progress = 1);
+      if (expected == null) {
+        throw StateError('release ships no checksum for this asset');
+      }
+      final actual = await UpdateService.fileSha256(staged);
+      if (actual != expected.toLowerCase()) {
+        throw StateError('downloaded file does not match the release checksum');
+      }
+      setState(() => _progress = 0);
+      await PerAppBackend.instance.command(
+        isApk
+            ? 'SET update.install_apk $staged $actual'
+            : 'SET update.flash_module $staged $actual',
+      );
+      File(staged).deleteSync();
+      if (isApk) {
+        // The installer replaces our own APK; the interface reconnects.
+        setState(() => _error = null);
+      }
+      await _check();
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _progress = 0;
+        _busy = false;
+        _error = error.toString().replaceFirst('Bad state: ', '');
+      });
+    }
+  }
+
+  String _sizeLabel(int bytes) => bytes <= 0
+      ? ''
+      : ' · ${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+
+  @override
+  Widget build(BuildContext context) {
+    final ColorScheme colors = Theme.of(context).colorScheme;
+    final bool dark = Theme.of(context).brightness == Brightness.dark;
+    final Widget banner = _error == null
+        ? const SizedBox.shrink()
+        : Padding(
+            padding: const EdgeInsets.only(top: 8, bottom: 2),
+            child: Row(
+              children: <Widget>[
+                Icon(
+                  Icons.info_outline_rounded,
+                  size: 15,
+                  color: colors.error,
+                ),
+                const SizedBox(width: 7),
+                Expanded(
+                  child: Text(
+                    maxLines: 3,
+                    overflow: TextOverflow.ellipsis,
+                    _error!,
+                    style: TextStyle(
+                      fontSize: 11,
+                      height: 1.35,
+                      color: colors.error,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          );
+    return SurfaceCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              Icon(Icons.system_update_rounded, size: 18, color: colors.primary),
+              const SizedBox(width: 9),
+              Expanded(
+                child: Text(
+                  'In-App Updates',
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w800,
+                    color: colors.onSurface,
+                  ),
+                ),
+              ),
+              TextButton(
+                onPressed: _busy ? null : _check,
+                child: Text(
+                  _busy && _progress <= 0 ? 'Checking…' : 'Check',
+                  style: const TextStyle(fontWeight: FontWeight.w700),
+                ),
+              ),
+            ],
+          ),
+          if (_installed != null || _release != null) ...<Widget>[
+            const SizedBox(height: 4),
+            Wrap(
+              spacing: 6,
+              runSpacing: 4,
+              children: <Widget>[
+                StatusPill(
+                  label: _installed == null
+                      ? 'Default'
+                      : 'Installed $_installed',
+                  accent: colors.secondary,
+                ),
+                if (_release != null)
+                  StatusPill(
+                    label: _upToDate ? 'Up to date' : 'New $_latestTag',
+                    accent: _upToDate
+                        ? const Color(0xFF41C98A)
+                        : colors.primary,
+                  ),
+              ],
+            ),
+            if (!_upToDate && (_release?.notes.isNotEmpty ?? false)) ...<Widget>[
+              const SizedBox(height: 10),
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: colors.surfaceContainer.withValues(
+                    alpha: dark ? 0.4 : 0.5,
+                  ),
+                  borderRadius: BorderRadius.circular(11),
+                ),
+                constraints: const BoxConstraints(maxHeight: 150),
+                child: SingleChildScrollView(
+                  child: Text(
+                    _release!.notes,
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      height: 1.45,
+                      color: colors.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 10),
+              Row(
+                children: <Widget>[
+                  Expanded(
+                    child: _UpdateAssetButton(
+                      label: 'Update APK$_sizeLabel(_release!.apkSize)',
+                      busy: _progress > 0.0001 && _progress < 1,
+                      progress: _progress,
+                      icon: Icons.system_update_alt_rounded,
+                      accent: colors.primary,
+                      onTap: () => _apply('apk'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: _UpdateAssetButton(
+                      label:
+                          'Flash module$_sizeLabel(_release!.zipSize)',
+                      busy: false,
+                      progress: _progress,
+                      icon: Icons.extension_rounded,
+                      accent: colors.secondary,
+                      onTap: () => _apply('zip'),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ],
+          banner,
+        ],
+      ),
+    );
+  }
+}
+
+class _UpdateAssetButton extends StatelessWidget {
+  const _UpdateAssetButton({
+    required this.label,
+    required this.busy,
+    required this.progress,
+    required this.icon,
+    required this.accent,
+    required this.onTap,
+  });
+
+  final String label;
+  final bool busy;
+  final double progress;
+  final IconData icon;
+  final Color accent;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: accent.withValues(alpha: 0.12),
+      borderRadius: BorderRadius.circular(12),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: busy ? null : onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 11, horizontal: 10),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              Row(
+                children: <Widget>[
+                  Icon(icon, size: 16, color: accent),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      busy ? 'Working…' : label,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        color: Theme.of(context).colorScheme.onSurface,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              if (busy) ...<Widget>[
+                const SizedBox(height: 8),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(99),
+                  child: LinearProgressIndicator(
+                    value: progress >= 1 ? null : progress,
+                    minHeight: 3,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
     );
   }
 }

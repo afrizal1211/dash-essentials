@@ -18,9 +18,11 @@ mod app_controls;
 mod app_runtime;
 mod bypass_policy;
 mod service_control;
+mod sha256;
 mod subsystem_clocks;
 mod system_colors;
 mod touch_resampler;
+mod update_runtime;
 
 pub const SOCKET_NAME: &str = "dash_essentiald_v15";
 pub const REVERSE_SOCKET_NAME: &str = "dash_essential_app_v15";
@@ -3782,7 +3784,7 @@ fn reset_expert_display() -> Result<(), String> {
     Ok(())
 }
 
-fn run_process_with_timeout(
+pub(crate) fn run_process_with_timeout(
     program: &str,
     args: &[&str],
     timeout: Duration,
@@ -7042,6 +7044,12 @@ fn dispatch_command(cmd: &str) -> String {
             Err(_) => return "ERR service transition lock poisoned".into(),
         };
         return match app_runtime::command(cmd) {
+            Ok(value) => format!("OK {value}"),
+            Err(error) => format!("ERR {error}"),
+        };
+    }
+    if update_runtime::is_command(cmd) {
+        return match update_runtime::command(cmd) {
             Ok(value) => format!("OK {value}"),
             Err(error) => format!("ERR {error}"),
         };

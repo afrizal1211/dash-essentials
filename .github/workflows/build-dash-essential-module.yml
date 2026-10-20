@@ -220,6 +220,8 @@ jobs:
           zip=(out/kernelsu-next/*/Dash-Essential-KernelSU-Next-Magisk-*.zip)
           sum=(out/kernelsu-next/*/Dash-Essential-KernelSU-Next-Magisk-*.zip.sha256)
           apk=(out/kernelsu-next/*/application/Dash-Essential.apk)
+          sha256sum "${apk[0]}" > "${apk[0]}.sha256"
+          [ -f "${apk[0]}.sha256" ] || { echo "missing APK checksum" >&2; exit 1; }
           [ "${#zip[@]}" -eq 1 ] || { echo "expected one module zip, found ${#zip[@]}" >&2; exit 1; }
           [ "${#sum[@]}" -eq 1 ] || { echo "expected one checksum, found ${#sum[@]}" >&2; exit 1; }
           [ "${#apk[@]}" -eq 1 ] || { echo "expected one application, found ${#apk[@]}" >&2; exit 1; }
@@ -254,11 +256,11 @@ jobs:
 
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" --clobber \
-              "${zip[@]}" "${sum[@]}" "${apk[@]}"
+              "${zip[@]}" "${sum[@]}" "${apk[@]}" "${apk[0]}.sha256"
           else
             gh release create "$GITHUB_REF_NAME" --verify-tag \
               --title "Dash Essential $GITHUB_REF_NAME" \
               --notes-file "$RUNNER_TEMP/notes.md" \
-              "${zip[@]}" "${sum[@]}" "${apk[@]}"
+              "${zip[@]}" "${sum[@]}" "${apk[@]}" "${apk[0]}.sha256"
           fi
 
