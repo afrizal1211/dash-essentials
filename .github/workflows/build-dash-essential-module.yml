@@ -242,6 +242,25 @@ jobs:
           `Dash-Essential.apk` is the same application the module installs, kept
           for sideloading or inspection.
 
+          NOTES
+
+          # Include this release's CHANGELOG section in the release body, matching
+          # the same `## X.Y.Z` block the Telegram step announces. The sections
+          # above are static; this keeps the notes in lockstep with CHANGELOG.md
+          # so no separate API patch is ever needed.
+          version="${GITHUB_REF_NAME#v}"
+          changelog="$(awk -v want="$version" '
+            $0 == "## " want { capture = 1 }
+            capture && /^## / && $0 != "## " want { exit }
+            capture { print }
+          ' CHANGELOG.md)"
+          if [ -n "$changelog" ]; then
+            printf '%s\n\n' "$changelog" >> "$RUNNER_TEMP/notes.md"
+          else
+            echo "no CHANGELOG section for $version; notes left without it" >&2
+          fi
+
+          cat >> "$RUNNER_TEMP/notes.md" <<'NOTES'
           ### Verify the download
 
           ```sh
@@ -260,6 +279,9 @@ jobs:
           printf '```\n' >> "$RUNNER_TEMP/notes.md"
 
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" \
+              --title "Dash Essential $GITHUB_REF_NAME" \
+              --notes-file "$RUNNER_TEMP/notes.md"
             gh release upload "$GITHUB_REF_NAME" --clobber \
               "${zip[@]}" "${sum[@]}" "${apk[@]}" "${apk[0]}.sha256"
           else
