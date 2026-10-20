@@ -86,13 +86,18 @@ fn flash_module(path: &str, expect: &str) -> Result<Value, String> {
     let mut attempts = Vec::<String>::new();
     for (flasher, base_args) in [
         ("/data/adb/ks/bin/ksud", vec!["module", "install"]),
+        ("/data/adb/ks/ksud", vec!["module", "install"]),
         ("/data/adb/ap/bin/ksud", vec!["module", "install"]),
+        ("/data/adb/ap/ksud", vec!["module", "install"]),
         ("/data/adb/magisk/magisk", vec!["--install-module"]),
+        ("/data/adb/magisk/magisk64", vec!["--install-module"]),
+        ("/sbin/magisk", vec!["--install-module"]),
+        ("/system/bin/magisk", vec!["--install-module"]),
     ] {
+        attempts.push(flasher.to_owned());
         if !Path::new(flasher).exists() {
             continue;
         }
-        attempts.push(flasher.to_owned());
         let result = crate::run_process_with_timeout(
             flasher,
             &{
