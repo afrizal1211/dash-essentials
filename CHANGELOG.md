@@ -83,6 +83,14 @@ original wording.
   longer requires the live OPP clock to already read 1612, which an idle,
   clock-gated GPU cannot report at toggle time; the clock check stays in
   the strict verified path for diagnostics.
+- Waking edge cases from device testing: a cluster that just left park
+  briefly reports EBUSY on its cpufreq nodes, so per-app apply/restore now
+  wait for the policy to finish waking instead of rolling the profile
+  back; and while the GPU sleeps, MediaTek's power service re-clamps the
+  devfreq floor to its stock idle value (1 MHz). A below-target Beast
+  floor and DVFS are only accepted together with a below-target clock
+  committed, so GPU waking must still show the full locked state; the
+  background GPU guard reasserts the floor until the ladder commits 1612.
 
 
 ## 1.18.6

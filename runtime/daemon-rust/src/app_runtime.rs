@@ -158,6 +158,28 @@ fn park_offline_again(mask: i32) -> Result<(), String> {
         .ok_or_else(|| errors.join("; "))
 }
 
+// Right after a cluster wakes from park, MediaTek cpufreq keeps returning
+// EBUSY on its scaling nodes for a short window while the policy driver
+// finishes waking up. Wait for one readable limit node before the profile
+// write; otherwise the profile rolls back although the state was healthy.
+fn wake_cluster(policy: u8) -> Result<(), String> {
+    if !cluster_online(policy) {
+        bring_cluster_online(policy)?;
+    }
+    for _ in 0..20 {
+        match read_cpu_cluster_limit(policy as i32, "scaling_min_freq") {
+            Ok(_) => return Ok(()),
+            Err(error) if error.contains("os error 16") => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(format!(
+        "policy{policy} cpufreq still busy after cluster wake"
+    ))
+}
+
 fn restore_parked_cores(c: &Control, saved: &Saved) -> Result<(), String> {
     match c {
         Control::CpuRange(_) | Control::CpuGovernor(_) => {
@@ -354,15 +376,11 @@ impl Hardware for Adapter {
             // PersistedState.thermal_mode and is restored by copy_preference.
             (Control::Thermal, Target::Thermal(v)) => write_mi_thermal_config_mode(*v),
             (Control::CpuRange(p), Target::CpuRange { min, max }) => {
-                if !cluster_online(*p) {
-                    bring_cluster_online(*p)?;
-                }
+                wake_cluster(*p)?;
                 set_cpu_cluster_freq_range(*p as i32, *min as i32, *max as i32)
             }
             (Control::CpuGovernor(p), Target::CpuGovernor(v)) => {
-                if !cluster_online(*p) {
-                    bring_cluster_online(*p)?;
-                }
+                wake_cluster(*p)?;
                 set_cpu_governor(*p as i32, v)?;
                 mutate_persisted_state(|s| match p {
                     0 => s.cpu0 = v.clone(),
@@ -417,17 +435,13 @@ impl Hardware for Adapter {
                         .as_i64()
                         .ok_or("missing original CPU maximum")? as i32,
                 ));
-                if !cluster_online(*p) {
-                    bring_cluster_online(*p)?;
-                }
+                wake_cluster(*p)?;
                 apply_cluster_freq_controls(*p as i32, desired.0, desired.1)?;
                 restore_parked_cores(c, saved)?;
             }
             Control::CpuGovernor(p) => {
                 let original = saved.live.as_str().ok_or("missing original governor")?;
-                if !cluster_online(*p) {
-                    bring_cluster_online(*p)?;
-                }
+                wake_cluster(*p)?;
                 set_cpu_governor(*p as i32, original)?;
                 restore_parked_cores(c, saved)?;
             }

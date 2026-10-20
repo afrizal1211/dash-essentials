@@ -5912,12 +5912,18 @@ fn gpu_profile_configured(profile: i32) -> bool {
             // gates on the live OPP clock at 1612; that read can stall on an
             // idle, clock-gated GPU (GED APO) even with the 1612 devfreq floor
             // committed, so the configured check stays clock-independent and
-            // the ladder rises as soon as the game submits frames.
-            min == 1612
+            // the ladder rises as soon as the game submits frames. MediaTek's
+            // power service also re-clamps the devfreq floor to its stock idle
+            // value (1 MHz on MT6991) while the GPU sleeps; a below-target
+            // floor and an unfrozen DVFS ladder are only accepted together
+            // with a below-target clock, so a genuinely awake GPU must still
+            // show the full locked state.
+            let below_target = gpu_get_cur_freq_mhz() < 1612;
+            (min == 1612 || below_target)
+                && (dvfs == 0 || below_target)
                 && max == 1612
                 && governor == "performance"
                 && gpu_boost_pipeline_matches(true)
-                && dvfs == 0
                 && power_policy == "always_on"
         }
         1 => {
