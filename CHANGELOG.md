@@ -65,6 +65,9 @@ original wording.
   blocks global `SET thermal.sconfig` writes, the guard pauses reassertion
   while owned, and leave/restore puts the saved global selection (or the
   journaled OEM value when none exists) back.
+- The module log is fresh on every boot and every new daemon run. The
+  previous contents rotate to `backend.log.1` (one generation) instead of
+  appending across reboots and only rotating at one megabyte.
 
 
 ## 1.18.6

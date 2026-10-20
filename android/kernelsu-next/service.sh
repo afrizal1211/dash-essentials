@@ -52,18 +52,13 @@ if [ "$DASH_NATIVE_MODE" -eq 1 ]; then
         /system/bin/restorecon -R "$DASH_NATIVE_STATE_ROOT" 2>/dev/null || true
 fi
 
-DASH_LOG_BYTES=0
-if [ -f "$DASH_LOG" ]; then
-    DASH_LOG_BYTES="$(wc -c <"$DASH_LOG" 2>/dev/null)"
-fi
-case "$DASH_LOG_BYTES" in
-    ''|*[!0-9]*) ;;
-    *)
-        if [ "$DASH_LOG_BYTES" -gt 1048576 ]; then
-            mv -f "$DASH_LOG" "$DASH_LOG_OLD"
-        fi
-        ;;
-esac
+# Keep exactly one previous generation for debugging, then start clean: the
+# phone reboot and every new daemon run both get an empty backend.log.
+dash_fresh_backend_log() {
+    [ -f "$DASH_LOG" ] && mv -f "$DASH_LOG" "$DASH_LOG_OLD"
+    : >"$DASH_LOG"
+}
+dash_fresh_backend_log
 
 # mkdir is an atomic early-boot lock and prevents duplicate watchdog loops.
 if ! mkdir "$DASH_WATCHDOG_LOCK" 2>/dev/null; then
@@ -227,6 +222,7 @@ while true; do
         continue
     fi
     if [ -x "$DASH_DAEMON" ] && ! pidof dash_daemon >/dev/null 2>&1; then
+        dash_fresh_backend_log
         echo "DASH_MODULE_DAEMON_START path=$DASH_DAEMON" >>"$DASH_LOG"
         "$DASH_DAEMON" >>"$DASH_LOG" 2>&1
         DASH_EXIT=$?
