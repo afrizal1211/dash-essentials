@@ -117,10 +117,16 @@ impl Capabilities {
                             _ => true,
                         }
                 }
-                (Control::CpuGovernor(policy), Target::CpuGovernor(value)) => self
-                    .cpu_governors
-                    .get(policy)
-                    .is_some_and(|table| table.contains(value)),
+                (Control::CpuGovernor(policy), Target::CpuGovernor(value)) => {
+                    match self.cpu_governors.get(policy) {
+                        Some(table) if !table.is_empty() => table.contains(value),
+                        // Cluster parked: the kernel removes the scaling
+                        // nodes, so no governor set can be discovered. The
+                        // live apply verifies against real sysfs and rolls
+                        // back, and can bring the cluster online first.
+                        _ => true,
+                    }
+                }
                 (Control::CpuCores, Target::CpuCores(mask)) => self.manual_cores && mask & 1 != 0,
                 _ => false,
             };
@@ -648,6 +654,31 @@ mod tests {
         assert!(caps.validate(&p).is_ok());
         // Inversion is rejected at parse, before capability validation.
         assert!(Profile::parse(&json!({"cpu":{"7":{"range":[3730,798]}}})).is_err());
+    }
+    #[test]
+    fn offline_cpu_policy_governor_is_accepted_not_guessed() {
+        // Same as the range rule: a parked cluster advertises no scaling
+        // nodes, so the governor is checked live in the apply path (which
+        // brings the cluster online and verifies against sysfs).
+        let mut caps = Capabilities::default();
+        caps.cpu_governors.insert(7, BTreeSet::new());
+        let p = Profile::parse(&json!({"cpu":{"7":{"governor":"schedutil"}}})).unwrap();
+        assert!(caps.validate(&p).is_ok());
+        // A real discovered table is still authoritative.
+        caps.cpu_governors.clear();
+        caps.cpu_governors
+            .insert(7, BTreeSet::from(["powersave".into()]));
+        assert!(caps.validate(&p).is_err());
+        caps.cpu_governors
+            .insert(7, BTreeSet::from(["schedutil".into()]));
+        assert!(caps.validate(&p).is_ok());
+        // An alphanumeric name parses; with a parked cluster (no discovered
+        // table) live sysfs stays the name authority via the apply path.
+        let unknown = Profile::parse(&json!({"cpu":{"7":{"governor":"turbo"}}})).unwrap();
+        let parked = Capabilities::default();
+        let mut parked = parked;
+        parked.cpu_governors.insert(7, BTreeSet::new());
+        assert!(parked.validate(&unknown).is_ok());
     }
     #[test]
     fn repeated_foreground_events_do_not_rewrite_hardware() {

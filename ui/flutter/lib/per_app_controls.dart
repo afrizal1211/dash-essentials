@@ -1227,7 +1227,13 @@ class _PerAppEditorState extends State<_PerAppEditor> {
     final List<int> frequencies = (caps['frequencies'] as List? ?? <dynamic>[])
         .map((dynamic v) => (v as num).toInt())
         .toList();
-    if (frequencies.isEmpty) return const SizedBox.shrink();
+    final List<dynamic> governors = caps['governors'] as List? ?? <dynamic>[];
+    // A parked cluster (e.g. the prime core parked by the kernel) also hides
+    // its frequency nodes; the governor option stays so the profile can
+    // still target it. Applying it brings the cluster online.
+    if (frequencies.isEmpty && governors.isEmpty) {
+      return const SizedBox.shrink();
+    }
     final List<dynamic>? range = _cpu(policy)['range'] as List?;
     final String name = policy == 0
         ? 'Efficiency cluster'
@@ -1246,17 +1252,18 @@ class _PerAppEditorState extends State<_PerAppEditor> {
               accent: const Color(0xFF67C2FF),
             ),
             const SizedBox(height: 14),
-            _choice(
-              'Frequency control',
-              range == null ? null : 'range',
-              const <String, String>{'range': 'Set minimum and maximum'},
-              (String? v) => _cpuSet(
-                policy,
-                'range',
-                v == null ? null : <int>[frequencies.first, frequencies.last],
+            if (frequencies.isNotEmpty) ...<Widget>[
+              _choice(
+                'Frequency control',
+                range == null ? null : 'range',
+                const <String, String>{'range': 'Set minimum and maximum'},
+                (String? v) => _cpuSet(
+                  policy,
+                  'range',
+                  v == null ? null : <int>[frequencies.first, frequencies.last],
+                ),
               ),
-            ),
-            if (range != null) ...<Widget>[
+              if (range != null) ...<Widget>[
               _choice(
                 'Minimum frequency',
                 range[0],
@@ -1299,13 +1306,25 @@ class _PerAppEditorState extends State<_PerAppEditor> {
               ),
               const SizedBox(height: 14),
             ],
+            ],
+            if (frequencies.isEmpty)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: Text(
+                  'This cluster is parked right now. Picking a governor '
+                  'brings its cores back online while the profile is active.',
+                  style: TextStyle(
+                    color: colors.onSurfaceVariant,
+                    fontSize: 12,
+                    height: 1.4,
+                  ),
+                ),
+              ),
             _choice(
               'Governor',
               _cpu(policy)['governor'],
               <String, String>{
-                for (final dynamic v
-                    in caps['governors'] as List? ?? <dynamic>[])
-                  '$v': '$v',
+                for (final dynamic v in governors) '$v': '$v',
               },
               (String? v) => _cpuSet(policy, 'governor', v),
             ),

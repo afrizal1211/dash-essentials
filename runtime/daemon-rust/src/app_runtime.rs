@@ -33,6 +33,14 @@ struct Saved {
     state: PersistedState,
     #[serde(default)]
     live: Value,
+    // Cluster online bits (cpu0..cpu7) captured when a CPU range or governor
+    // was taken over. -1 means unknown / not captured (legacy journals). The
+    // parked cores return to this mask after the original values are back.
+    #[serde(default = "default_online_mask")]
+    online_mask: i32,
+}
+fn default_online_mask() -> i32 {
+    -1
 }
 static ORIGINALS: OnceLock<Mutex<BTreeMap<String, Saved>>> = OnceLock::new();
 static RUNTIME: OnceLock<Mutex<Runtime>> = OnceLock::new();
@@ -94,6 +102,72 @@ fn control(key: &str) -> Option<Control> {
         }),
     }
 }
+fn cluster_cores(policy: u8) -> &'static [usize] {
+    match policy {
+        0 => &[0, 1, 2, 3],
+        4 => &[4, 5, 6],
+        7 => &[7],
+        _ => &[],
+    }
+}
+
+fn cpu_online_bit(cpu: usize) -> bool {
+    cpu == 0
+        || read_trimmed(format!("/sys/devices/system/cpu/cpu{cpu}/online"))
+            .map(|value| value == "1")
+            .unwrap_or(false)
+}
+
+fn cluster_online(policy: u8) -> bool {
+    cluster_cores(policy).iter().any(|cpu| cpu_online_bit(*cpu))
+}
+
+// The kernel removes a cpufreq policy's scaling nodes while every core of
+// the cluster is parked; bring them back so the write can happen. Offline
+// cores return to the captured mask once the original values are restored.
+fn bring_cluster_online(policy: u8) -> Result<(), String> {
+    let mut errors = Vec::<String>::new();
+    for cpu in cluster_cores(policy) {
+        if let Err(error) = write_cpu_online(*cpu, true) {
+            errors.push(error);
+        }
+    }
+    errors
+        .is_empty()
+        .then_some(())
+        .ok_or_else(|| errors.join("; "))
+}
+
+fn park_offline_again(mask: i32) -> Result<(), String> {
+    let mut errors = Vec::<String>::new();
+    for cpu in 1..=7 {
+        if (mask & (1 << cpu)) == 0
+            && let Err(error) = write_cpu_online(cpu, false)
+        {
+            errors.push(error);
+        }
+    }
+    errors
+        .is_empty()
+        .then_some(())
+        .ok_or_else(|| errors.join("; "))
+}
+
+fn restore_parked_cores(c: &Control, saved: &Saved) -> Result<(), String> {
+    match c {
+        Control::CpuRange(_) | Control::CpuGovernor(_) => {
+            if saved.online_mask < 0 {
+                return Ok(());
+            }
+            if let Err(error) = park_offline_again(saved.online_mask) {
+                eprintln!("APP_RUNTIME park restore {error}");
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 fn copy_preference(c: &Control, from: &PersistedState, to: &mut PersistedState) {
     match c {
         Control::Touch => to.touch = from.touch,
@@ -240,7 +314,15 @@ impl Hardware for Adapter {
             }
             _ => Value::Null,
         };
-        let saved = Saved { state, live };
+        let online_mask = match c {
+            Control::CpuRange(_) | Control::CpuGovernor(_) => live_cpu_mask(),
+            _ => -1,
+        };
+        let saved = Saved {
+            state,
+            live,
+            online_mask,
+        };
         self.captured.insert(key(c), saved.clone());
         Ok(saved)
     }
@@ -267,9 +349,15 @@ impl Hardware for Adapter {
             // PersistedState.thermal_mode and is restored by copy_preference.
             (Control::Thermal, Target::Thermal(v)) => write_mi_thermal_config_mode(*v),
             (Control::CpuRange(p), Target::CpuRange { min, max }) => {
+                if !cluster_online(*p) {
+                    bring_cluster_online(*p)?;
+                }
                 set_cpu_cluster_freq_range(*p as i32, *min as i32, *max as i32)
             }
             (Control::CpuGovernor(p), Target::CpuGovernor(v)) => {
+                if !cluster_online(*p) {
+                    bring_cluster_online(*p)?;
+                }
                 set_cpu_governor(*p as i32, v)?;
                 mutate_persisted_state(|s| match p {
                     0 => s.cpu0 = v.clone(),
@@ -324,12 +412,20 @@ impl Hardware for Adapter {
                         .as_i64()
                         .ok_or("missing original CPU maximum")? as i32,
                 ));
+                if !cluster_online(*p) {
+                    bring_cluster_online(*p)?;
+                }
                 apply_cluster_freq_controls(*p as i32, desired.0, desired.1)?;
+                restore_parked_cores(c, saved)?;
             }
-            Control::CpuGovernor(p) => set_cpu_governor(
-                *p as i32,
-                saved.live.as_str().ok_or("missing original governor")?,
-            )?,
+            Control::CpuGovernor(p) => {
+                let original = saved.live.as_str().ok_or("missing original governor")?;
+                if !cluster_online(*p) {
+                    bring_cluster_online(*p)?;
+                }
+                set_cpu_governor(*p as i32, original)?;
+                restore_parked_cores(c, saved)?;
+            }
             Control::Thermal => {
                 // The saved global choice wins when one exists; otherwise hand
                 // the journaled OEM baseline back to mi_thermald so the last
@@ -665,6 +761,25 @@ fn capabilities() -> Result<Capabilities, String> {
     }
     caps.manual_cores = Path::new("/sys/devices/system/cpu/cpu1/online").exists();
     caps.thermal = Path::new(MI_THERMAL_SCONFIG).exists();
+    // A parked cluster exposes no scaling_available_governors. The cpufreq
+    // policies share the governor interface on this kernel, so let an
+    // offline cluster borrow the union of the online clusters' sets; the
+    // live apply still verifies against the policy's own node after the
+    // cores are brought back online.
+    let shared: BTreeSet<String> = caps
+        .cpu_governors
+        .values()
+        .flat_map(|table| table.iter().cloned())
+        .collect();
+    for p in [0, 4, 7] {
+        let empty = caps
+            .cpu_governors
+            .get(&p)
+            .is_none_or(|table| table.is_empty());
+        if empty {
+            caps.cpu_governors.insert(p, shared.clone());
+        }
+    }
     Ok(caps)
 }
 fn capabilities_json() -> Result<Value, String> {

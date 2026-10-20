@@ -68,6 +68,16 @@ original wording.
 - The module log is fresh on every boot and every new daemon run. The
   previous contents rotate to `backend.log.1` (one generation) instead of
   appending across reboots and only rotating at one megabyte.
+- Per-app CPU profiles now apply to parked clusters. When the prime core
+  (or a whole cluster) is offline, cpufreq hides its scaling nodes, which
+  used to fail the profile with `unsupported per-app control:
+  CpuGovernor(7)` / `CpuRange(7)`. A parked cluster's governor is now
+  accepted (live sysfs verifies the write), the capability probe borrows
+  the shared governor set, applying or restoring a range/governor brings
+  the cluster's cores back online, and release parks them back to the
+  captured mask. Per-app GPU controls were audited and need no change:
+  the Mali devfreq nodes persist through power collapse and GPU profile
+  writes fail soft.
 
 
 ## 1.18.6
