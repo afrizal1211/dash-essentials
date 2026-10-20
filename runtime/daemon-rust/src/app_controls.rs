@@ -47,6 +47,7 @@ pub(super) enum Control {
     Touch,
     Refresh,
     Gpu,
+    Thermal,
     CpuRange(u8),
     CpuGovernor(u8),
     CpuCores,
@@ -58,6 +59,9 @@ pub(super) enum Target {
     /// Zero means OEM adaptive, not a manufactured fixed refresh rate.
     Refresh(u16),
     Gpu(u8),
+    /// MI thermal config (sconfig) mode. Concrete modes only: "untouched"
+    /// means simply not selecting the control.
+    Thermal(i32),
     CpuRange {
         min: u32,
         max: u32,
@@ -85,6 +89,7 @@ pub(super) struct Capabilities {
     pub touch: BTreeSet<u8>,
     pub refresh: BTreeSet<u16>,
     pub gpu: BTreeSet<u8>,
+    pub thermal: bool,
     pub cpu_frequencies: BTreeMap<u8, BTreeSet<u32>>,
     pub cpu_governors: BTreeMap<u8, BTreeSet<String>>,
     pub manual_cores: bool,
@@ -97,6 +102,9 @@ impl Capabilities {
                 (Control::Touch, Target::Touch(value)) => self.touch.contains(value),
                 (Control::Refresh, Target::Refresh(value)) => self.refresh.contains(value),
                 (Control::Gpu, Target::Gpu(value)) => self.gpu.contains(value),
+                (Control::Thermal, Target::Thermal(mode)) => {
+                    self.thermal && super::valid_mi_thermal_config_mode(*mode)
+                }
                 (Control::CpuRange(policy), Target::CpuRange { min, max }) => {
                     min <= max
                         && match self.cpu_frequencies.get(policy) {
@@ -149,13 +157,21 @@ impl Profile {
     pub fn parse(value: &Value) -> Result<Self, String> {
         fields(
             value,
-            &["enabled", "touch", "refresh", "gpu", "cpu", "cores"],
+            &[
+                "enabled", "touch", "refresh", "gpu", "thermal", "cpu", "cores",
+            ],
         )?;
         let mut profile = Self {
             enabled: boolean(value, "enabled")?,
             ..Self::default()
         };
-        for (key, max) in [("touch", 3), ("gpu", 3), ("cores", 255), ("refresh", 120)] {
+        for (key, max) in [
+            ("touch", 3),
+            ("gpu", 3),
+            ("cores", 255),
+            ("refresh", 120),
+            ("thermal", 0x800),
+        ] {
             if value.get(key).is_none_or(Value::is_null) {
                 continue;
             }
@@ -163,6 +179,7 @@ impl Profile {
             let (control, target) = match key {
                 "touch" => (Control::Touch, Target::Touch(number as u8)),
                 "gpu" => (Control::Gpu, Target::Gpu(number as u8)),
+                "thermal" => (Control::Thermal, Target::Thermal(number as i32)),
                 "cores" if number & 1 != 0 => (Control::CpuCores, Target::CpuCores(number as u8)),
                 "refresh" if matches!(number, 0 | 60 | 90 | 120) => {
                     (Control::Refresh, Target::Refresh(number as u16))
@@ -228,6 +245,7 @@ impl Profile {
                 (Control::Touch, Target::Touch(v)) => value["touch"] = json!(v),
                 (Control::Refresh, Target::Refresh(v)) => value["refresh"] = json!(v),
                 (Control::Gpu, Target::Gpu(v)) => value["gpu"] = json!(v),
+                (Control::Thermal, Target::Thermal(v)) => value["thermal"] = json!(v),
                 (Control::CpuCores, Target::CpuCores(v)) => value["cores"] = json!(v),
                 (Control::CpuRange(policy), Target::CpuRange { min, max }) => {
                     let key = policy.to_string();
@@ -554,6 +572,33 @@ mod tests {
         let p = Profile::parse(&json!({"enabled":true,"touch":0,"refresh":0,"gpu":null})).unwrap();
         assert_eq!(p.controls.get(&Control::Touch), Some(&Target::Touch(0)));
         assert!(!p.controls.contains_key(&Control::Gpu));
+    }
+    #[test]
+    fn thermal_profile_round_trips_and_stays_in_range() {
+        let p = Profile::parse(&json!({"enabled":true,"thermal":6})).unwrap();
+        assert_eq!(p.controls.get(&Control::Thermal), Some(&Target::Thermal(6)));
+        assert_eq!(Profile::parse(&p.json()).unwrap(), p);
+
+        assert!(Profile::parse(&json!({"enabled":true,"thermal":0})).is_ok());
+        assert!(Profile::parse(&json!({"enabled":true,"thermal":2048})).is_ok());
+        // Above 0x800 and negatives fail parse; null follows global.
+        assert!(Profile::parse(&json!({"enabled":true,"thermal":2049})).is_err());
+        assert!(Profile::parse(&json!({"enabled":true,"thermal":-1})).is_err());
+        assert!(
+            Profile::parse(&json!({"enabled":true,"thermal":null}))
+                .unwrap()
+                .controls
+                .is_empty()
+        );
+    }
+    #[test]
+    fn thermal_requires_supported_hardware_and_valid_mode() {
+        let mut caps = Capabilities::default();
+        let p = Profile::parse(&json!({"enabled":false,"thermal":6})).unwrap();
+        assert!(caps.validate(&p).is_err());
+        caps.thermal = true;
+        assert!(caps.validate(&p).is_ok());
+        assert!(Profile::parse(&json!({"enabled":false,"thermal":2049})).is_err());
     }
     #[test]
     fn rejects_untrusted_or_unsupported_configuration() {

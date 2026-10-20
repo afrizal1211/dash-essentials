@@ -90,6 +90,11 @@ uses the focused activity summary, not the first floating/resumed window.
   disabled and active states; packages without launcher entries are identified.
 - The last released CPU override restores the journaled original thermal mode,
   including after daemon restart. Governors remain independently selected.
+- A profile can select an MI thermal (sconfig) mode. The global thermal
+  choice stays in `thermal_mode`; ownership applies the profile mode to the
+  hardware on focus, blocks global `SET thermal.sconfig` writes while the
+  control is owned, pauses the global drift reassertion guard, and on leave
+  or disable restores the saved global mode or the journaled OEM value.
 - ROM policy adds scoped package-service lookup and activity-log reading.
   Existing module daemon startup is reused; no extra privileged UI service.
 - Reset per app, reset all, and profile disable restore owned controls.

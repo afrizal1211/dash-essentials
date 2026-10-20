@@ -69,6 +69,7 @@ fn key(control: &Control) -> String {
     match control {
         Control::Touch => "touch".into(),
         Control::Gpu => "gpu".into(),
+        Control::Thermal => "thermal".into(),
         Control::Refresh => "refresh".into(),
         Control::CpuCores => "cores".into(),
         Control::CpuRange(p) => format!("range{p}"),
@@ -79,6 +80,7 @@ fn control(key: &str) -> Option<Control> {
     match key {
         "touch" => Some(Control::Touch),
         "gpu" => Some(Control::Gpu),
+        "thermal" => Some(Control::Thermal),
         "refresh" => Some(Control::Refresh),
         "cores" => Some(Control::CpuCores),
         _ => [0, 4, 7].into_iter().find_map(|p| {
@@ -111,6 +113,7 @@ fn copy_preference(c: &Control, from: &PersistedState, to: &mut PersistedState) 
             to.cpu_min_freq7 = from.cpu_min_freq7;
             to.cpu_max_freq7 = from.cpu_max_freq7;
         }
+        Control::Thermal => to.thermal_mode = from.thermal_mode,
         Control::CpuGovernor(0) => to.cpu0 = from.cpu0.clone(),
         Control::CpuGovernor(4) => to.cpu4 = from.cpu4.clone(),
         Control::CpuGovernor(7) => to.cpu7 = from.cpu7.clone(),
@@ -228,6 +231,7 @@ impl Hardware for Adapter {
             Control::CpuGovernor(p) => json!(read_trimmed(format!(
                 "/sys/devices/system/cpu/cpufreq/policy{p}/scaling_governor"
             ))?),
+            Control::Thermal => json!(read_mi_thermal_config_mode().unwrap_or(-1)),
             Control::Refresh => {
                 let user = current_user()?;
                 json!({"user":user,"min":settings(user,"get","min_refresh_rate",None)?,"max":settings(user,"get","peak_refresh_rate",None)?,
@@ -259,6 +263,9 @@ impl Hardware for Adapter {
         match (c, target) {
             (Control::Touch, Target::Touch(v)) => set_touch_profile(*v as i32),
             (Control::Gpu, Target::Gpu(v)) => apply_performance_profile(*v as i32),
+            // Hardware write only: the saved global choice stays in
+            // PersistedState.thermal_mode and is restored by copy_preference.
+            (Control::Thermal, Target::Thermal(v)) => write_mi_thermal_config_mode(*v),
             (Control::CpuRange(p), Target::CpuRange { min, max }) => {
                 set_cpu_cluster_freq_range(*p as i32, *min as i32, *max as i32)
             }
@@ -323,6 +330,17 @@ impl Hardware for Adapter {
                 *p as i32,
                 saved.live.as_str().ok_or("missing original governor")?,
             )?,
+            Control::Thermal => {
+                // The saved global choice wins when one exists; otherwise hand
+                // the journaled OEM baseline back to mi_thermald so the last
+                // profile mode cannot stick. copy_preference below reinstalls
+                // the global thermal_mode afterwards.
+                if saved.state.thermal_mode >= 0 {
+                    write_mi_thermal_config_mode(saved.state.thermal_mode)?;
+                } else {
+                    release_mi_thermal_to_oem()?;
+                }
+            }
             Control::CpuCores => {
                 if saved.state.cpu_manual == 1 {
                     set_cpu_manual(true)?;
@@ -646,6 +664,7 @@ fn capabilities() -> Result<Capabilities, String> {
         );
     }
     caps.manual_cores = Path::new("/sys/devices/system/cpu/cpu1/online").exists();
+    caps.thermal = Path::new(MI_THERMAL_SCONFIG).exists();
     Ok(caps)
 }
 fn capabilities_json() -> Result<Value, String> {
@@ -655,7 +674,7 @@ fn capabilities_json() -> Result<Value, String> {
         cpu[p.to_string()] = json!({"frequencies":caps.cpu_frequencies.get(&p),"governors":caps.cpu_governors.get(&p)});
     }
     Ok(
-        json!({"touch":caps.touch,"gpu":caps.gpu,"refresh":caps.refresh,"cpu":cpu,"cores":caps.manual_cores}),
+        json!({"touch":caps.touch,"gpu":caps.gpu,"thermal":caps.thermal,"refresh":caps.refresh,"cpu":cpu,"cores":caps.manual_cores}),
     )
 }
 fn foreground() -> Result<Option<App>, String> {
@@ -879,6 +898,8 @@ pub(super) fn check_global_command(cmd: &str) -> Result<(), String> {
             || cmd.starts_with("ACTION gpu.")
         {
             entries.contains_key("gpu")
+        } else if cmd.starts_with("SET thermal.sconfig ") {
+            entries.contains_key("thermal")
         } else if cmd.starts_with("SET cpu.manual ") || cmd.starts_with("SET cpu.core ") {
             entries.contains_key("cores")
         } else if cmd.starts_with("SET cpu.") || cmd.starts_with("ACTION cpu.") {
@@ -920,6 +941,21 @@ pub(super) fn check_global_command(cmd: &str) -> Result<(), String> {
         Status::Global => Ok(()),
     }
 }
+pub(super) fn owns_thermal() -> bool {
+    let owned = originals()
+        .lock()
+        .map(|entries| entries.contains_key("thermal"))
+        .unwrap_or(false);
+    if !owned {
+        return false;
+    }
+    // Recovery tokens are not ownership; see check_global_command.
+    runtime()
+        .lock()
+        .map(|r| matches!(r.owner.status, Status::Active(_)))
+        .unwrap_or(false)
+}
+
 pub(super) fn release() -> Result<(), String> {
     if !RECOVERY_READY.load(Ordering::Acquire) {
         recover()?;

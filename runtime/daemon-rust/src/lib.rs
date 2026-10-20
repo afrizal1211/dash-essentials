@@ -1526,11 +1526,11 @@ fn apply_thermal_mode(mode: i32) -> Result<(), String> {
     Ok(())
 }
 
-fn reset_thermal_mode() -> Result<(), String> {
-    mutate_persisted_state(|state| state.thermal_mode = -1)?;
-    // Hand the thermal configuration back to mi_thermald immediately by
-    // restoring the journaled value, mirroring the disable path. Without
-    // this the last override would stick until mi_thermald's next rewrite.
+// Hand the thermal configuration back to mi_thermald by restoring the
+// journaled service-control original with readback verification. Mirrors
+// the disable path so the last override cannot stick, and is shared by the
+// global reset and the per-app release.
+fn release_mi_thermal_to_oem() -> Result<(), String> {
     if let Some(value) = service_control::original(MI_THERMAL_SCONFIG)
         .as_ref()
         .and_then(Value::as_str)
@@ -1547,6 +1547,11 @@ fn reset_thermal_mode() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn reset_thermal_mode() -> Result<(), String> {
+    mutate_persisted_state(|state| state.thermal_mode = -1)?;
+    release_mi_thermal_to_oem()
 }
 
 fn restore_saved_thermal_mode() -> Result<(), String> {
@@ -4830,9 +4835,11 @@ fn cpu_frequency_guard() {
             }
 
             // mi_thermald may overwrite a user-selected sconfig mode at
-            // runtime. Reassert only on real drift and only while no custom
-            // CPU range owns the thermal configuration.
+            // runtime. Reassert only on real drift, only while no custom CPU
+            // range owns the thermal configuration, and never while a
+            // foreground Per-App profile owns the thermal control.
             if !has_saved_range
+                && !app_runtime::owns_thermal()
                 && state.thermal_mode >= 0
                 && let Ok(current) = read_mi_thermal_config_mode()
                 && current != state.thermal_mode

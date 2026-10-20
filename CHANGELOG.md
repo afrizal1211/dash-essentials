@@ -60,7 +60,11 @@ original wording.
   drift reassertion by the CPU frequency guard while no custom CPU range owns
   the thermal configuration. Reset and disable restore the journaled OEM
   value. The host bridge exposes the live mode and the app CPU screen gains a
-  mode selector with OEM Reset.
+  mode selector with OEM Reset. Per-App Controls can now also select an MI
+  thermal mode per app: a profile's choice is written on focus, ownership
+  blocks global `SET thermal.sconfig` writes, the guard pauses reassertion
+  while owned, and leave/restore puts the saved global selection (or the
+  journaled OEM value when none exists) back.
 
 
 ## 1.18.6

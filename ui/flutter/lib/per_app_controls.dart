@@ -405,7 +405,7 @@ class _PerAppControlsScreenState extends State<PerAppControlsScreen> {
         ),
         const SizedBox(height: 10),
         const Text(
-          'Set individual touch, refresh rate, CPU and GPU controls for each app.',
+          'Set individual touch, refresh rate, CPU, GPU and thermal controls for each app.',
           style: TextStyle(fontSize: 14, height: 1.4),
         ),
         const SizedBox(height: 16),
@@ -1103,6 +1103,39 @@ class _PerAppEditorState extends State<_PerAppEditor> {
             ],
           ),
         ),
+        const SizedBox(height: 14),
+        if (widget.capabilities['thermal'] == true)
+          SurfaceCard(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                const _PerAppSectionTitle(
+                  title: 'Thermal mode',
+                  icon: Icons.thermostat_rounded,
+                  accent: Color(0xFFFF8E3C),
+                ),
+                const SizedBox(height: 14),
+                _choice(
+                  'MI thermal mode',
+                  _draft['thermal'],
+                  <String, String>{
+                    for (final int v in const <int>[0, 1, 2, 3, 4, 5, 6])
+                      '$v': v == 0
+                          ? '0 · Normal'
+                          : v == 6
+                          ? '6 · No Limits'
+                          : 'Mode $v',
+                  },
+                  (String? v) => _set('thermal', v == null ? null : int.parse(v)),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Writes the MI sconfig thermal profile while the app is focused. Leaving the app restores your global selection, or the OEM value when no global mode is saved.',
+                  style: TextStyle(fontSize: 11, height: 1.4),
+                ),
+              ],
+            ),
+          ),
         const SizedBox(height: 14),
         for (final int policy in <int>[0, 4, 7]) _cluster(policy, colors),
         if (widget.capabilities['cores'] == true)
