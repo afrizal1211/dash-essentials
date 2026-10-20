@@ -373,10 +373,12 @@ impl Hardware for Adapter {
             (Control::Touch, Target::Touch(v)) => set_touch_profile(*v as i32),
             (Control::Gpu, Target::Gpu(v)) => {
                 // Per-app GPU is a hardware override, not a global profile
-                // change. Marking the override makes the drift guard leave the
-                // Mali nodes alone, and the hardware-only apply never rewrites
-                // the user's global `perf` choice, so a stock global profile
-                // cannot drag the app's gaming clocks back down.
+                // change. Raising the override immediately closes the window
+                // before the transition boundary re-syncs derived state, so the
+                // drift guard cannot stomp the write mid-apply; the
+                // hardware-only apply never rewrites the user's global `perf`
+                // choice, so a stock global profile cannot drag the app's
+                // gaming clocks back down.
                 set_per_app_gpu_override(true);
                 apply_performance_profile_hardware(*v as i32)
             }
@@ -450,9 +452,11 @@ impl Hardware for Adapter {
                             return Err(error);
                         }
                     }
-                    // The global profile is back in force: hand the Mali nodes
-                    // back to the drift guard.
-                    set_per_app_gpu_override(false);
+                    // The global profile is back in force once the transition
+                    // boundary drops Gpu from the applied set; `sync_applied`
+                    // hands the Mali nodes back to the drift guard there, even
+                    // when an earlier restore step failed and left the control
+                    // in RecoveryRequired.
                 }
                 Control::CpuRange(p) => {
                     let desired = persisted_cpu_range(&saved.state, *p as i32).unwrap_or((
@@ -532,6 +536,16 @@ impl Hardware for Adapter {
             Err(error) => format!("per-app restore {name} -> ERR {error}"),
         });
         result
+    }
+    /// The GPU override flag is a cache of whether the `gpu` control is in the
+    /// applied set. Reconciling it here, at every transition boundary, means a
+    /// failed apply or an early-returned restore can never leave the drift guard
+    /// permanently ignoring the Mali nodes — the single most damaging failure
+    /// mode of a hand-maintained toggle.
+    fn sync_applied(&mut self, applied: &BTreeMap<Control, Target>) {
+        if applied.contains_key(&Control::Gpu) != per_app_gpu_override_active() {
+            set_per_app_gpu_override(applied.contains_key(&Control::Gpu));
+        }
     }
 }
 
@@ -1210,6 +1224,11 @@ fn recover() -> Result<(), String> {
             errors.push(format!("{name}: {error}"));
         }
     }
+    // Recovery releases every prior override, so no control is applied once it
+    // finishes; a failed restore is tracked separately as a recovery token, not
+    // as a live override. Reconcile the derived GPU flag to that truth so a
+    // crash-orphaned override can never leave the drift guard blinded.
+    Adapter::new().sync_applied(&BTreeMap::new());
     if errors.is_empty() {
         Ok(())
     } else {

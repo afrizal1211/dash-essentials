@@ -8,7 +8,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Output as ProcessOutput, Stdio};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -376,17 +376,25 @@ static DISPLAY_SILKY_STATE: AtomicI32 = AtomicI32::new(-1);
 static DISPLAY_VIDEO_STATE: AtomicI32 = AtomicI32::new(-1);
 static DISPLAY_DOLBY_STATE: AtomicI32 = AtomicI32::new(-1);
 static PERFORMANCE_STATE: AtomicI32 = AtomicI32::new(-1);
-/// Non-zero while a Per-App Controls GPU override owns the Mali profile. The
-/// background drift guard leaves the hardware alone while this is set, so it
-/// cannot reassert the global profile over the app's override.
-static PER_APP_GPU_OVERRIDE: AtomicI32 = AtomicI32::new(0);
+/// Set while a Per-App Controls GPU override owns the Mali profile. The
+/// background drift guard leaves the GPU alone while this is set, so it cannot
+/// reassert the global profile over the app's override.
+///
+/// This is a lock-free *cache* of the per-app ownership, not the source of
+/// truth: the guard thread runs while `Adapter::transition` holds the runtime
+/// mutex, so it cannot query ownership directly (the transition path in turn
+/// needs the GPU apply lock the guard holds, which would deadlock). The cache is
+/// reconciled from the applied-control set at every ownership transition through
+/// [`set_per_app_gpu_override`], so a failed or skipped apply/restore cannot
+/// strand the guard off.
+static PER_APP_GPU_OVERRIDE: AtomicBool = AtomicBool::new(false);
 
 fn set_per_app_gpu_override(active: bool) {
-    PER_APP_GPU_OVERRIDE.store(i32::from(active), Ordering::Release);
+    PER_APP_GPU_OVERRIDE.store(active, Ordering::Release);
 }
 
 fn per_app_gpu_override_active() -> bool {
-    PER_APP_GPU_OVERRIDE.load(Ordering::Acquire) != 0
+    PER_APP_GPU_OVERRIDE.load(Ordering::Acquire)
 }
 
 fn abstract_addr(name: &str) -> Result<(SockAddrUn, u32), String> {
@@ -2128,13 +2136,17 @@ pub fn enforce_performance_profile(profile: i32) -> bool {
                 "/sys/class/misc/mali0/device/devfreq/48000000.mali/governor",
                 "simple_ondemand",
             );
-            write_ged_opp_index(
-                "/sys/kernel/ged/hal/custom_boost_gpu_freq",
-                GPU_MIN_FREQ_MHZ,
-                FreqBound::AtLeast,
-            );
+            // `custom_boost_gpu_freq` is GED's boost *target* on this SoC, and
+            // the generic governor is inert, so a non-zero index here runs the
+            // GPU at that clock: writing the 338 MHz minimum pinned Gaming
+            // Dynamic to the bottom of the ladder ("locked at the lowest
+            // frequency"). Point the target at index 0 (fastest OPP) so GED
+            // boosts to 1612 under load, and let the load ramp move the
+            // *ceiling* below to hold clocks back when the GPU is idle.
+            let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "0");
             // Index 0 is the fastest OPP of every GPUEB ladder, so it needs no
-            // table lookup: it lifts this profile's ceiling out of the way.
+            // table lookup: it lifts this profile's ceiling out of the way. The
+            // guard's load ramp lowers it when the GPU is idle.
             let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "0");
             let _ =
                 service_control::write("/sys/class/misc/mali0/device/power_policy", "always_on");
@@ -2162,11 +2174,10 @@ pub fn enforce_performance_profile(profile: i32) -> bool {
                 "/sys/class/misc/mali0/device/devfreq/48000000.mali/governor",
                 "powersave",
             );
-            write_ged_opp_index(
-                "/sys/kernel/ged/hal/custom_boost_gpu_freq",
-                GPU_MIN_FREQ_MHZ,
-                FreqBound::AtLeast,
-            );
+            // Point GED's boost target at index 0 (fastest) so Battery Saver
+            // does not run the GPU at 338 MHz; the 598 MHz ceiling below is the
+            // actual limit, through `custom_upbound_gpu_freq` and devfreq max.
+            let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "0");
             write_ged_opp_index(
                 "/sys/kernel/ged/hal/custom_upbound_gpu_freq",
                 GPU_BATTERY_CEILING_MHZ,
@@ -2200,11 +2211,10 @@ pub fn enforce_performance_profile(profile: i32) -> bool {
                 "/sys/class/misc/mali0/device/devfreq/48000000.mali/governor",
                 "dummy",
             );
-            write_ged_opp_index(
-                "/sys/kernel/ged/hal/custom_boost_gpu_freq",
-                GPU_MIN_FREQ_MHZ,
-                FreqBound::AtLeast,
-            );
+            // Point GED's boost target at index 0 (fastest) so Stock is not
+            // pinned to 338 MHz. Stock hands live scaling to the vendor power
+            // HAL and only needs the full ladder available.
+            let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "0");
             // Index 0 is the fastest OPP of every GPUEB ladder, so it needs no
             // table lookup: it lifts this profile's ceiling out of the way.
             let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "0");
@@ -4841,7 +4851,13 @@ fn reassert_persisted_governors() {
     // Stock mode is owned by MediaTek's power HAL. Tuned profiles use the
     // persisted desired state as their single source of truth, so the guard
     // cannot fight a second hard-coded profile writer.
-    if state.perf > 0 {
+    //
+    // A Per-App Controls GPU override owns the Mali profile while it is in
+    // force: it drives the hardware through `apply_performance_profile_hardware`
+    // and never persists the global choice, so the persisted state still names
+    // the *global* profile here. Reasserting it would stomp the app's override
+    // within a tick. Leave the GPU (and the profile-owned GED boost) alone then.
+    if state.perf > 0 && !per_app_gpu_override_active() {
         let target_gpu = if !state.gpu_governor.is_empty() {
             state.gpu_governor.as_str()
         } else if !state.gpu.is_empty() {
@@ -4874,10 +4890,14 @@ fn reassert_persisted_governors() {
 
     // GED boost is profile-owned. Keep all three MediaTek boost flags enabled
     // only for Gaming Dynamic and Extreme Beast, including while Stock is
-    // otherwise left under the vendor power HAL.
-    let desired_ged_boost = profile_uses_ged_boost(state.perf);
-    if state.perf >= 0 && !gpu_boost_pipeline_matches(desired_ged_boost) {
-        let _ = set_gpu_ged_boost(desired_ged_boost);
+    // otherwise left under the vendor power HAL. Like the GPU block above, this
+    // is skipped while a per-app override owns the profile, so the guard cannot
+    // reassert the global boost pipeline over the app's live state.
+    if !per_app_gpu_override_active() {
+        let desired_ged_boost = profile_uses_ged_boost(state.perf);
+        if state.perf >= 0 && !gpu_boost_pipeline_matches(desired_ged_boost) {
+            let _ = set_gpu_ged_boost(desired_ged_boost);
+        }
     }
 
     PERFORMANCE_PROFILE_VERIFIED.store(1, Ordering::Release);
@@ -4980,7 +5000,6 @@ fn cpu_frequency_guard() {
 }
 
 fn gaming_dynamic_guard() {
-    let mut last_written_opp = -1;
     let mut smoothed_load = 0;
     let mut boost_until = Instant::now();
     let mut last_drift_reassert = Instant::now();
@@ -5051,7 +5070,6 @@ fn gaming_dynamic_guard() {
         }
 
         if !desired_ged_boost {
-            last_written_opp = -1;
             smoothed_load = 0;
             boost_until = Instant::now();
             drop(profile_guard);
@@ -5105,34 +5123,42 @@ fn gaming_dynamic_guard() {
         let now = Instant::now();
 
         // The MT6991 accepts the generic simple_ondemand governor name but
-        // does not drive the MediaTek GED OPP policy from it. GED's custom
-        // boost node is an OPP floor (0 = fastest, last = slowest), so use it
-        // as the real on-demand actuator while retaining the requested
-        // governor and the full unrestricted frequency table.
+        // does not drive the MediaTek GED OPP policy from it. Both GED custom
+        // nodes are index selectors with 0 = fastest, but on this firmware
+        // `custom_boost_gpu_freq` is GED's boost target, so writing a low index
+        // there *runs the GPU low* rather than merely permitting it. Gaming
+        // Dynamic therefore points that target at index 0 (fastest, written by
+        // `enforce_performance_profile`) and moves the *ceiling*
+        // (`custom_upbound_gpu_freq`) with the load ramp instead. At idle the
+        // ceiling drops so the SoC cools without locking the clock; under load
+        // it opens fully so the GPU can reach 1612.
         if load >= 85 {
             boost_until = now + Duration::from_millis(500);
         }
 
         let lowest_opp = gpu_get_lowest_opp_index();
         let current_opp = gpu_get_cur_opp_index();
-        let target_opp = if now < boost_until {
+        let target_ceiling = if now < boost_until {
             0
         } else {
             // The ramp is expressed in OPP steps; on Dash's collapsed ladder
             // those have to be turned into distinct frequencies before they can
-            // move the floor.
+            // move the ceiling.
             let ramp = gaming_dynamic_target_opp(smoothed_load, current_opp, lowest_opp);
             opp_index_stepped_by_levels(live_gpu_opp_table(), current_opp, ramp - current_opp)
         };
 
-        if target_opp != last_written_opp
-            && service_control::write(
-                "/sys/kernel/ged/hal/custom_boost_gpu_freq",
-                target_opp.to_string(),
-            )
-            .is_ok()
-        {
-            last_written_opp = target_opp;
+        // Compare against the *live* node, not just the last value this loop
+        // wrote. The vendor stack reclaims the ceiling (observed back on the
+        // stock low index), and Beast or a per-app restore can also have moved
+        // it; a cache-only check would then skip the heal forever whenever the
+        // computed target happened to be unchanged. Reading it back costs one
+        // small node read per tick and guarantees drift is corrected.
+        if gpu_ged_ceiling_index() != Some(target_ceiling) {
+            let _ = service_control::write(
+                "/sys/kernel/ged/hal/custom_upbound_gpu_freq",
+                target_ceiling.to_string(),
+            );
         }
 
         drop(profile_guard);
@@ -5678,16 +5704,27 @@ fn gpu_write_file(primary: &str, fallback: &str, value: &str) -> Result<(), Stri
     }
 }
 
-/// Whether GED's minimum-frequency floor (`custom_boost_gpu_freq`) currently
-/// points at the fastest OPP, index 0. Beast writes 0 there; row 0 of the
-/// working table is the 1612 MHz OPP, so a pinned floor of 0 holds the GPU at
-/// 1612 once DVFS is frozen. Any other value (or a failed read) is "not
-/// floored" so callers fall back to the live-clock check.
-fn gpu_ged_floor_is_fastest() -> bool {
-    gpu_read_raw("/sys/kernel/ged/hal/custom_boost_gpu_freq")
+/// Read a GED custom-frequency index node, taking the first whitespace-token
+/// (the node echoes `index:pid:1 value:index`-style lines on some kernels).
+fn gpu_ged_index(path: &str) -> Option<i32> {
+    gpu_read_raw(path)
         .and_then(|s| s.split_whitespace().next().map(str::to_string))
         .and_then(|first| first.parse::<i32>().ok())
-        == Some(0)
+}
+
+/// Whether GED's boost target (`custom_boost_gpu_freq`) is the fastest OPP,
+/// index 0, i.e. 1612 MHz on this ladder. MediaTek GED treats this node as the
+/// frequency it boosts to, so 0 is simultaneously "target the fastest OPP" and
+/// — with DVFS frozen by Beast — a pinned 1612 MHz. A value that is not 0 (or an
+/// unreadable node) means the target is lower, so Beast is not yet locked.
+fn gpu_ged_floor_is_fastest() -> bool {
+    gpu_ged_index("/sys/kernel/ged/hal/custom_boost_gpu_freq") == Some(0)
+}
+
+/// The OPP index currently held in GED's upper-bound node
+/// (`custom_upbound_gpu_freq`), or `None` when unreadable.
+fn gpu_ged_ceiling_index() -> Option<i32> {
+    gpu_ged_index("/sys/kernel/ged/hal/custom_upbound_gpu_freq")
 }
 
 fn gpu_read_raw(path: &str) -> Option<String> {
@@ -5717,11 +5754,14 @@ fn gpu_get_loading() -> i32 {
 /// reachable through `/proc/gpufreqv2/gpu_working_opp_table`. That proc file
 /// dumps `g_shared_status->working_table_gpu`, which is the very table GED
 /// resolves its indices against, and both writable GED nodes take one of its
-/// indices: `custom_boost_gpu_freq` is a minimum-frequency floor and
-/// `custom_upbound_gpu_freq` is a maximum-frequency cap, with `0` meaning the
-/// fastest OPP. Dash's ladder is not a uniform 26 MHz step -- 24 of its 52
-/// indices all run at 1430 MHz -- so an index is always resolved from the live
-/// table and never computed from a frequency.
+/// indices: `custom_boost_gpu_freq` and `custom_upbound_gpu_freq`, with `0`
+/// meaning the fastest OPP. On this firmware the generic governor is inert, so
+/// the nodes are the live actuator: a low `custom_boost_gpu_freq` index *runs*
+/// the GPU low instead of merely permitting it. Profiles therefore hold that
+/// node open at index 0 and limit with `custom_upbound_gpu_freq`. Dash's ladder
+/// is not a uniform 26 MHz step -- 24 of its 52 indices all run at 1430 MHz --
+/// so an index is always resolved from the live table and never computed from a
+/// frequency.
 const GPU_MIN_FREQ_MHZ: i32 = 338;
 const GPU_BATTERY_CEILING_MHZ: i32 = 598;
 
@@ -5777,9 +5817,11 @@ fn live_gpu_opp_table() -> Option<&'static [(i32, i32)]> {
 /// caller never ends up with a looser cap or a lower floor than it asked for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FreqBound {
-    /// The slowest OPP that still runs at or above the request, for
-    /// `custom_boost_gpu_freq`. Rounding down would let the GPU drop below the
-    /// minimum frequency the caller asked for.
+    /// The slowest OPP that still runs at or above the request. Kept for the
+    /// mapping's contract and tests; production callers now only ever write a
+    /// literal `0` boost target or an `AtMost` ceiling, because a non-zero boost
+    /// index runs the GPU low on this firmware rather than raising a floor.
+    #[cfg_attr(not(test), allow(dead_code))]
     AtLeast,
     /// The fastest OPP that stays at or below the request, for
     /// `custom_upbound_gpu_freq`. Rounding up would leave the cap looser than
@@ -5813,15 +5855,16 @@ fn opp_index_for_freq_mhz(table: &[(i32, i32)], mhz: i32, bound: FreqBound) -> O
 }
 
 /// Map a frequency to a GED OPP index, or `None` when the firmware ladder
-/// cannot be read. Leaving GED untouched is safer than guessing: the historic
-/// 26 MHz formula asks for index 49 on Dash, which is a 572 MHz minimum rather
-/// than the 338 MHz floor it was meant to allow.
+/// cannot be read, so an index is always resolved from the live table and never
+/// computed from the historic 26 MHz formula (which asks for index 49 on Dash, a
+/// 572 MHz point rather than the 338 MHz truth).
 fn ged_opp_index_for_mhz(mhz: i32, bound: FreqBound) -> Option<i32> {
     live_gpu_opp_table().and_then(|table| opp_index_for_freq_mhz(table, mhz, bound))
 }
 
-/// Point a GED index node at `mhz`, skipping the write when the firmware ladder
-/// is unavailable so a stale mapping can never pin the GPU.
+/// Point a GED index node at the index for `mhz`, skipping the write when the
+/// firmware ladder is unavailable: writing a guess is worse than leaving the
+/// node, since on this firmware the index *is* the clock.
 fn write_ged_opp_index(node: &str, mhz: i32, bound: FreqBound) {
     if let Some(index) = ged_opp_index_for_mhz(mhz, bound) {
         let _ = service_control::write(node, index.to_string());
@@ -5881,9 +5924,9 @@ fn gaming_dynamic_target_opp(load: i32, current_opp: i32, lowest_opp: i32) -> i3
 
 /// Walk the OPP ladder by `steps` *distinct frequencies* instead of `steps`
 /// table slots. Dash's firmware table collapses 24 adjacent indices onto
-/// 1430 MHz, so the load ramp's raw offsets would otherwise move the GED floor
-/// without changing the frequency it enforces. The offsets were tuned on the
-/// uniform 26 MHz ladder, where the two are the same thing.
+/// 1430 MHz, so the load ramp's raw offsets would otherwise move the GED
+/// ceiling index without changing the frequency it caps at. The offsets were
+/// tuned on the uniform 26 MHz ladder, where the two are the same thing.
 fn opp_index_stepped_by_levels(table: Option<&[(i32, i32)]>, from: i32, steps: i32) -> i32 {
     if steps == 0 {
         return from;
@@ -6117,8 +6160,10 @@ fn beast_gpu_state() -> String {
 }
 
 /// Rewrite the stable half of a profile the vendor stack drifted away from.
-/// The Gaming Dynamic load ramp owns `custom_boost_gpu_freq`, so this never
-/// touches the floor: a mid-game reassert must not throw the ramp away.
+/// The Gaming Dynamic load ramp owns `custom_upbound_gpu_freq`, so this leaves
+/// the ceiling to the ramp: a mid-game reassert must not throw the ramp away.
+/// It does keep GED's boost target (`custom_boost_gpu_freq`) at index 0, so a
+/// low index the vendor stack left behind can never run the clock low.
 fn reassert_gpu_profile_drift(profile: i32) {
     let thermal_limited = gpu_get_thermal_state() > 0;
     match profile {
@@ -6147,10 +6192,12 @@ fn reassert_gpu_profile_drift(profile: i32) {
                     "simple_ondemand",
                 );
             }
-            // The GED ceiling is the clamp the vendor stack keeps reinstating
-            // on this SoC (observed live as `custom_upbound_gpu_freq` sitting
-            // on the 338 MHz stock index); 0 lifts it back out of the way.
-            let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "0");
+            // Keep GED's boost target at index 0 (fastest) so Gaming Dynamic is
+            // never run low if the vendor stack leaves a low index here. The
+            // load ramp owns `custom_upbound_gpu_freq`, so the ceiling is
+            // deliberately not touched: a mid-game reassert must not throw the
+            // ramp away.
+            let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "0");
             let _ =
                 service_control::write("/sys/class/misc/mali0/device/power_policy", "always_on");
         }
@@ -6178,11 +6225,10 @@ fn reassert_gpu_profile_drift(profile: i32) {
                     "powersave",
                 );
             }
-            write_ged_opp_index(
-                "/sys/kernel/ged/hal/custom_boost_gpu_freq",
-                GPU_MIN_FREQ_MHZ,
-                FreqBound::AtLeast,
-            );
+            // Point the boost target at index 0 instead of 338 MHz: as with
+            // Gaming Dynamic, a low index here runs the clock low. Battery
+            // Saver's limit is the 598 MHz ceiling, not a 338 MHz boost target.
+            let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "0");
             write_ged_opp_index(
                 "/sys/kernel/ged/hal/custom_upbound_gpu_freq",
                 GPU_BATTERY_CEILING_MHZ,
@@ -6370,15 +6416,24 @@ fn gpu_profile_accepted(profile: i32) -> bool {
 }
 
 fn set_gpu_min_freq(mhz: i32) -> Result<(), String> {
-    if !(338..=1612).contains(&mhz) {
+    if !(GPU_MIN_FREQ_MHZ..=1612).contains(&mhz) {
         return Err("GPU minimum frequency must be 338-1612 MHz".into());
     }
     let hz = (mhz as u64) * 1_000_000;
-    write_ged_opp_index(
-        "/sys/kernel/ged/hal/custom_boost_gpu_freq",
-        mhz,
-        FreqBound::AtLeast,
-    );
+    // `custom_boost_gpu_freq` is the live actuator on this SoC, so it must stay
+    // open (index 0 = fastest) for an ordinary minimum: writing the 338 MHz
+    // floor's index would pin the clock there instead of merely allowing it. Only
+    // a genuine fastest-OPP lock (Beast at 1612) may point the actuator at its
+    // pinned index. The devfreq minimum below expresses the requested floor
+    // without constraining the ladder.
+    // Always point the boost target at literal index 0 (fastest, 1612 MHz). The
+    // node is GED's boost target, so any other index runs the GPU low; a
+    // requested minimum is expressed through the devfreq floor below, never by
+    // lowering this index. This also matches `write_beast_gpu_constraints` and
+    // the Beast lock reader (`gpu_ged_floor_is_fastest`). Resolving 1612 MHz
+    // through the table would pick index 3 (rows 0-3 all run at 1612 MHz and
+    // `AtLeast` chooses the slowest), which the lock reader would reject.
+    let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "0");
     gpu_write_file(
         "/sys/class/devfreq/48000000.mali/min_freq",
         "/sys/class/misc/mali0/device/devfreq/48000000.mali/min_freq",
@@ -6482,11 +6537,9 @@ fn set_gpu_uncap(enable: bool) -> Result<(), String> {
     } else {
         service_control::write("/sys/class/misc/mali0/device/power_policy", "coarse_demand")
             .map_err(|error| format!("GPU power policy write failed: {error}"))?;
-        write_ged_opp_index(
-            "/sys/kernel/ged/hal/custom_boost_gpu_freq",
-            GPU_MIN_FREQ_MHZ,
-            FreqBound::AtLeast,
-        );
+        // Point GED's boost target at index 0 (fastest) rather than writing the
+        // 338 MHz minimum, which this firmware treats as the clock to run.
+        let _ = service_control::write("/sys/kernel/ged/hal/custom_boost_gpu_freq", "0");
         let _ = service_control::write("/sys/kernel/ged/hal/custom_upbound_gpu_freq", "0");
         let _ = service_control::write("/sys/kernel/ged/hal/gpu_boost_level", "0");
         gpu_write_file(
@@ -8398,9 +8451,10 @@ posdiv: 0, margin:     0, power:     0\n";
         assert_eq!(dash[0], (0, 1_612_000));
         assert_eq!(dash[51], (51, 338_000));
 
-        // A minimum-frequency floor resolves to the slowest OPP that still runs
-        // at or above the request, so the 338 MHz profile minimum is index 51.
-        // The historic 26 MHz formula asks for index 49, a 572 MHz floor here.
+        // An `AtLeast` request resolves to the slowest OPP that still runs at
+        // or above it, so 338 MHz maps to index 51. Production code no longer
+        // writes a 338 MHz floor to the boost node (it would pin the clock
+        // there); this pins the mapping's contract for the `AtLeast` bound.
         assert_eq!(
             opp_index_for_freq_mhz(&dash, GPU_MIN_FREQ_MHZ, FreqBound::AtLeast),
             Some(51)
@@ -8476,9 +8530,13 @@ posdiv: 0, margin:     0, power:     0\n";
     #[test]
     fn per_app_gpu_override_gate_toggles() {
         // The guard reads this flag to decide whether it may touch the Mali
-        // nodes. A per-app GPU apply sets it, the restore clears it.
+        // nodes. The adapter reconciles it from the applied-control set at every
+        // ownership transition, so the flag is idempotent and never sticky.
         set_per_app_gpu_override(false);
         assert!(!per_app_gpu_override_active());
+        set_per_app_gpu_override(true);
+        assert!(per_app_gpu_override_active());
+        // Reconciling to the same value is a no-op, not a flip.
         set_per_app_gpu_override(true);
         assert!(per_app_gpu_override_active());
         set_per_app_gpu_override(false);
@@ -8519,6 +8577,33 @@ posdiv: 0, margin:     0, power:     0\n";
         assert_eq!(opp_index_stepped_by_levels(table, 0, -5), 0);
         // Without the firmware ladder the ramp degrades to raw index steps.
         assert_eq!(opp_index_stepped_by_levels(None, 20, 4), 24);
+    }
+
+    #[test]
+    fn gaming_ramp_ceiling_opens_under_load_and_never_pins_the_floor() {
+        // `custom_upbound_gpu_freq` is a ceiling where 0 is the fastest OPP.
+        // The ramp must drive *that* node: fully open (0) under load so the GPU
+        // can reach 1612, and only lowered toward the slow end when idle. It
+        // must never leave the actuator at a low index while allowing scaling,
+        // which is what pinned Gaming Dynamic to 338 MHz.
+        let dash = dash_working_opp_table();
+        let lowest = 51;
+
+        // Full load targets the fastest ceiling.
+        assert_eq!(gaming_dynamic_target_opp(100, 20, lowest), 0);
+        assert_eq!(gaming_dynamic_target_opp(85, 20, lowest), 0);
+
+        // Idle hands back the slowest ceiling, so the SoC can power-collapse.
+        assert!(gaming_dynamic_target_opp(5, 20, lowest) > 20);
+
+        // A ceiling is only ever a cap: the ramp target is never above the
+        // ladder's slowest index, so it cannot pin below what the firmware
+        // allows.
+        for load in 0..=100 {
+            let ceiling = gaming_dynamic_target_opp(load, 20, lowest);
+            assert!((0..=lowest).contains(&ceiling), "load {load} -> {ceiling}");
+        }
+        assert_eq!(opp_index_stepped_by_levels(Some(dash.as_slice()), 0, 0), 0);
     }
 
     #[test]

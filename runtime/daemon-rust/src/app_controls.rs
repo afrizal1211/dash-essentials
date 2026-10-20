@@ -383,6 +383,12 @@ pub(super) trait Hardware {
     fn capture(&mut self, control: &Control) -> Result<Self::Saved, String>;
     fn apply(&mut self, control: &Control, target: &Target) -> Result<(), String>;
     fn restore(&mut self, control: &Control, saved: &Self::Saved) -> Result<(), String>;
+    /// Reconcile any lock-free state derived from the applied-control set.
+    /// Called at every ownership transition boundary — after a successful
+    /// change and after every rollback — so that a control whose individual
+    /// apply or restore failed still leaves the derived state correct. The
+    /// default is a no-op for adapters with no derived state.
+    fn sync_applied(&mut self, _applied: &BTreeMap<Control, Target>) {}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -481,6 +487,7 @@ impl<S: Clone> Ownership<S> {
         self.status = desired
             .map(|(app, _)| Status::Active(app.clone()))
             .unwrap_or(Status::Global);
+        hardware.sync_applied(&self.applied);
         Ok(())
     }
 
@@ -505,6 +512,10 @@ impl<S: Clone> Ownership<S> {
         } else {
             self.status = Status::RecoveryRequired(errors.join("; "));
         }
+        // Reconcile derived state from what actually remains applied, so a GPU
+        // override that could not be torn down is reflected honestly rather than
+        // assumed released.
+        hardware.sync_applied(&self.applied);
         Err(match &self.status {
             Status::RecoveryRequired(error) => format!("{cause}; restore pending: {error}"),
             _ => cause,
@@ -523,6 +534,8 @@ mod tests {
         fail_apply: Option<Control>,
         fail_restore: Option<Control>,
         fail_capture: Option<Control>,
+        // Every `sync_applied` view, in call order, for boundary tests.
+        applied_syncs: Vec<BTreeSet<Control>>,
     }
     impl Hardware for FakeHardware {
         type Saved = Target;
@@ -548,6 +561,10 @@ mod tests {
             }
             self.values.insert(c.clone(), s.clone());
             Ok(())
+        }
+        fn sync_applied(&mut self, applied: &BTreeMap<Control, Target>) {
+            self.applied_syncs
+                .insert(0, applied.keys().cloned().collect());
         }
     }
     fn app() -> App {
@@ -720,6 +737,37 @@ mod tests {
         owner.transition(&mut h, None, None, true, true).unwrap();
         assert_eq!(h.values[&Control::Touch], Target::Touch(0));
     }
+    #[test]
+    fn sync_applied_reports_the_true_applied_set_at_every_boundary() {
+        // Derived state (the drift guard's GPU override flag) is reconciled from
+        // this view, so it must name exactly the controls that are applied: gpu
+        // present while the profile is live, absent once released, and absent
+        // after a rollback that tore the override back down.
+        let mut h = hardware();
+        let mut owner = Ownership::default();
+        owner
+            .transition(&mut h, Some(&app()), Some(&profile()), true, true)
+            .unwrap();
+        // Newest sync is first: apply boundary sees both controls.
+        assert!(h.applied_syncs[0].contains(&Control::Gpu));
+        assert!(h.applied_syncs[0].contains(&Control::Touch));
+
+        owner.transition(&mut h, None, None, true, true).unwrap();
+        assert!(h.applied_syncs[0].is_empty());
+
+        // A failed apply rolls the override back; the boundary after rollback
+        // must report it gone, never leaving the guard blinded.
+        let mut h = hardware();
+        h.fail_apply = Some(Control::Gpu);
+        let mut owner = Ownership::default();
+        assert!(
+            owner
+                .transition(&mut h, Some(&app()), Some(&profile()), true, true)
+                .is_err()
+        );
+        assert!(!h.applied_syncs[0].contains(&Control::Gpu));
+    }
+
     #[test]
     fn service_disable_and_profile_disable_release_controls() {
         for (service, profiles) in [(false, true), (true, false), (false, false)] {

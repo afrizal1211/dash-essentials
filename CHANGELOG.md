@@ -106,6 +106,24 @@ original wording.
   alongside the zip and APK so the updater never has to trust a bare
   download.
 
+## 1.18.11
+
+Codename: Yuzuki.
+
+- GPU profiles stop pinning the clock to the bottom of the ladder. On this SoC
+  the generic `simple_ondemand` governor name is accepted but does not drive
+  GPUEB, so the GED node `custom_boost_gpu_freq` is the live frequency actuator
+  rather than a soft floor: writing the 338 MHz minimum made the GPU *run* at
+  338 MHz. Gaming Dynamic, Stock Balanced and Battery Saver now hold that node
+  open (index 0, the fastest OPP) and limit through the ceiling
+  (`custom_upbound_gpu_freq`) and the devfreq maximum, so the GPU scales
+  normally instead of reading as "locked at the lowest frequency".
+- The Gaming Dynamic load ramp now moves the GED ceiling instead of the floor.
+  Under load the ceiling opens fully so the GPU can reach 1612 MHz; at idle it
+  lowers the cap so the SoC power-collapses and cools without ever freezing the
+  clock low. The drift reassert keeps the floor open and no longer throws the
+  ramp away mid-game.
+
 ## 1.18.10
 
 Codename: Tsuki.
