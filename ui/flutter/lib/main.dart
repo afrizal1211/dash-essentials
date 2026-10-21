@@ -3090,7 +3090,7 @@ class _HomePulseHero extends StatelessWidget {
         };
         final String profileDescription = switch (activePerf) {
           2 => 'Efficiency-first clocks and reduced power demand',
-          1 => 'Unrestricted 260–1612 MHz GPU scaling with GED boost',
+          1 => 'Unrestricted 338–1612 MHz GPU scaling with GED boost',
           3 => 'GPU locked at the 1612 MHz hardware ceiling',
           _ => 'OEM-balanced performance and efficiency for everyday use',
         };
@@ -3112,7 +3112,7 @@ class _HomePulseHero extends StatelessWidget {
           3 => '1000 / 500 Hz',
           _ => 'ROM control',
         };
-        final int liveGpuFreq = backend.extendedValue(46) >= 260
+        final int liveGpuFreq = backend.extendedValue(46) > 0
             ? backend.extendedValue(46)
             : 0;
         final String gpu = liveGpuFreq > 0 ? '$liveGpuFreq MHz' : '—';
@@ -3323,9 +3323,11 @@ class _HomePulseHero extends StatelessWidget {
                                 child: _HomeHeroMetric(
                                   label: 'MALI GPU',
                                   value: gpu,
-                                  detail: liveGpuFreq > 0
-                                      ? 'Live clock'
-                                      : 'Waiting for GPU',
+                                  detail: liveGpuFreq <= 0
+                                      ? 'Waiting for GPU'
+                                      : (liveGpuFreq < _dashGpuFloorMhz
+                                            ? 'GPU idle'
+                                            : 'Live clock'),
                                   icon: Icons.sports_esports_rounded,
                                   accent: const Color(0xFFFF5252),
                                   onTap: () => onOpen(DashScreen.maliGpu),
@@ -3992,8 +3994,8 @@ class _LiveOverviewGrid extends StatelessWidget {
         final int onlineCores = _dashOnlineCoreCount(snapshot);
 
         final gpuMhz = backend.extendedValue(46);
-        final gpuValue = snapshot.ready && gpuMhz >= 260 ? '$gpuMhz MHz' : '—';
-        final gpuSubtitle = snapshot.ready
+        final gpuValue = snapshot.ready && gpuMhz > 0 ? '$gpuMhz MHz' : '—';
+        final String gpuSubtitle = gpuMhz > 0
             ? 'Live graphics clock'
             : 'Waiting for GPU';
 
@@ -4315,6 +4317,13 @@ int _dashOnlineCoreCount(DashBackendSnapshot snapshot) {
   return count;
 }
 
+/// Dash's Mali ladder starts at 338 MHz. Below it the driver gates the GPU
+/// into a 26 MHz deep-idle clock, which is a real reading but not a running
+/// GPU. Upstream's device started at 260 MHz, so its floor doubled as the
+/// "is the GPU working" test; on this one it does not, and the ladder has no
+/// 260 MHz point at all.
+const int _dashGpuFloorMhz = 338;
+
 String _dashPerformanceLabel(int profile) {
   return switch (profile) {
     0 => 'Stock Balanced',
@@ -4368,7 +4377,7 @@ class HubsScreen extends StatelessWidget {
             : 0;
         final int rawMinFreq = backend.extendedValue(47) >= 0
             ? backend.extendedValue(47)
-            : 260;
+            : 338;
         final int rawMaxFreq = backend.extendedValue(48) >= 0
             ? backend.extendedValue(48)
             : 1612;
@@ -4379,7 +4388,7 @@ class HubsScreen extends StatelessWidget {
         final bool isBeast =
             (rawUncap == 1 && rawMinFreq == 1612 && rawMaxFreq == 1612) ||
             activePerf == 3;
-        final String gpuLabel = liveGpuFreq >= 260
+        final String gpuLabel = liveGpuFreq >= _dashGpuFloorMhz
             ? '$liveGpuFreq MHz'
             : (isBeast ? '1612 MHz' : '$rawMaxFreq MHz');
         final String displayMode = switch (snapshot.displayColor) {
@@ -12636,7 +12645,7 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
     setState(() {
       _optimisticProfile = 0;
       _optimisticUncap = false;
-      _optimisticMinFreq = 260;
+      _optimisticMinFreq = 338;
       _optimisticMaxFreq = 1612;
       _optimisticGov = 4;
       _optimisticGedBoost = false;
@@ -12686,7 +12695,7 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
             : 0;
         final int rawMinFreq = backend.extendedValue(47) >= 0
             ? backend.extendedValue(47)
-            : 260;
+            : 338;
         final int rawMaxFreq = backend.extendedValue(48) >= 0
             ? backend.extendedValue(48)
             : 1612;
@@ -12763,11 +12772,11 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
             : (isGaming
                   ? (liveCurFreq > 0
                         ? 'Live: $liveCurFreq MHz · Scaling freely to 1.61 GHz'
-                        : 'Full-range scaling · 260–1612 MHz')
+                        : 'Full-range scaling · 338–1612 MHz')
                   : (isBattery
                         ? (liveCurFreq > 0
                               ? 'Live: $liveCurFreq MHz · Efficiency cap at 598 MHz'
-                              : 'Efficiency range · 260–598 MHz')
+                              : 'Efficiency range · 338–598 MHz')
                         : (liveCurFreq > 0
                               ? 'Live: $liveCurFreq MHz · OEM-managed behavior'
                               : 'Vendor-managed clocks and power policy')));
@@ -13008,7 +13017,7 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
         : (isGaming
               ? (liveCurFreq > 0
                     ? 'Dynamic Gaming Load ($liveCurFreq MHz · 1.61 GHz Ceiling)'
-                    : 'Standby Dynamic (260 – 1612 MHz · GED Boost Active)')
+                    : 'Standby Dynamic (338 – 1612 MHz · GED Boost Active)')
               : (isBattery
                     ? (liveCurFreq > 0
                           ? 'Live $liveCurFreq MHz · $minFreq–$maxFreq MHz Battery Range'
@@ -13342,13 +13351,13 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
                 isDark: isDark,
                 colors: colors,
                 title: 'Gaming Dynamic',
-                range: '260–1612 MHz · Full-range scaling',
+                range: '338–1612 MHz · Full-range scaling',
                 icon: Icons.sports_esports_rounded,
                 accent: const Color(0xFFFFB84D),
                 isActive: isGaming,
                 onTap: () => onSelect(
                   1,
-                  260,
+                  338,
                   1612,
                   0,
                   true,
@@ -13375,7 +13384,7 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
                 isActive: isStock,
                 onTap: () => onSelect(
                   0,
-                  260,
+                  338,
                   1612,
                   4,
                   false,
@@ -13392,13 +13401,13 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
                 isDark: isDark,
                 colors: colors,
                 title: 'Battery Saver',
-                range: '260–598 MHz · Efficiency cap',
+                range: '338–598 MHz · Efficiency cap',
                 icon: Icons.energy_savings_leaf_rounded,
                 accent: const Color(0xFF41C98A),
                 isActive: isBattery,
                 onTap: () => onSelect(
                   2,
-                  260,
+                  338,
                   598,
                   2,
                   false,

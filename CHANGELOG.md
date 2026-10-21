@@ -106,9 +106,29 @@ original wording.
   alongside the zip and APK so the updater never has to trust a bare
   download.
 
+## 1.18.18
+
+Codename: Mizar. **Pre-release.** The dashboard's GPU monitor stops showing a
+dash for a clock that is really there, and the GPU controls stop quoting a
+frequency this device does not have.
+
+- The live GPU clock on the Home dashboard and in the Live overview now shows
+  the reading whenever there is one. The Mali driver gates the GPU into a
+  26 MHz deep-idle clock when it is not doing any work, and the dashboard
+  treated anything under 260 MHz as "no reading" and showed a dash, while the
+  Mali screen showed the clock. 260 MHz was the lowest clock upstream's device
+  ever reported, so the floor doubled as the "is the GPU working" test; on
+  this one it is not. The Home tile now says "GPU idle" for a gated GPU and
+  "Live clock" when the GPU is running.
+- Every GPU frequency the app quotes is the device's own ladder. Dash's Mali
+  ladder starts at 338 MHz and has no 260 MHz point at all, so the Gaming
+  Dynamic, Stock Balanced and Battery Saver presets, the profile descriptions
+  and the readback fallbacks were all naming a frequency that does not exist
+  and a minimum the daemon rejects.
+
 ## 1.18.17
 
-Codename: Alcyone. **Pre-release.** Rebased onto upstream Rodin Essential's
+Codename: Merak. **Pre-release.** Rebased onto upstream Rodin Essential's
 GPU actuation model, which this port had replaced with an inverted reading of
 the same nodes.
 
