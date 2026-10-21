@@ -106,6 +106,47 @@ original wording.
   alongside the zip and APK so the updater never has to trust a bare
   download.
 
+## 1.18.17
+
+Codename: Alcyone. **Pre-release.** Rebased onto upstream Rodin Essential's
+GPU actuation model, which this port had replaced with an inverted reading of
+the same nodes.
+
+- The GPU boost node is a **floor**, not the clock the GPU runs at. Upstream
+  writes the ladder position of the requested minimum to
+  `custom_boost_gpu_freq` and the frequency itself to the
+  `gpu_bottom_freq` / `gpu_cust_boost_freq` module parameters; the ceiling
+  gets the same treatment on `custom_upbound_gpu_freq` and
+  `gpu_cust_upbound_freq`. The port had concluded the opposite -- that the
+  boost node named the frequency the GPU runs at -- and wrote the fastest OPP
+  there for every profile, with the frequency parameters left untouched as
+  "reporting only". The field logs show why that reading was wrong: the
+  MediaTek power service publishes index 51 there, which is exactly the
+  338 MHz floor a profile asks for. Under the floor reading the vendor's own
+  write is a benign floor, and under the target reading it looked like a
+  hostile pin, which is what the last few releases were built to fight.
+- Every profile now publishes the floor and the ceiling the way MediaTek's own
+  tooling does it: the ladder index on the GED node and the frequency on the
+  module parameter. The ladder is Dash's own 52-entry table, so the indices
+  are resolved from the live table rather than from the historic 26 MHz
+  formula.
+- The Gaming Dynamic load ramp moves the **floor** with the load again, the
+  way upstream does it, instead of moving the ceiling and leaving the floor
+  pinned. The ramp still compares against the live node, so the vendor's
+  reclaim of the floor is corrected on the next tick.
+- Extreme Beast pins the floor to the fastest OPP, publishes 1612 MHz on the
+  module parameters and freezes DVFS once the live clock reaches the target,
+  which is upstream's lock condition. The port's stricter "the boost node must
+  name the fastest OPP" check is gone with the model it belonged to.
+- Stock Balanced's devfreq ceiling is restored when the MediaTek power HAL
+  lowers it while the display idles. The governor and the power policy stay
+  untouched there: the vendor owns them, and the platform's own `dummy`
+  governor is still accepted as a valid reading rather than reported as a
+  fault.
+- The port's diagnostics are kept: the measured clock from the GPUFREQ status
+  dump, the limit-table readback, the verified thermal ceiling and the
+  per-app override handling all stay as they were.
+
 ## 1.18.16
 
 Codename: Alcyone. **Pre-release.** Fixes the Per-App Controls GPU profiles
