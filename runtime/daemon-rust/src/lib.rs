@@ -1998,25 +1998,174 @@ const GPU_LIMIT_THERMAL_AP: i32 = 4;
 /// transition instead of one per tick.
 static GPU_LIMIT_THERMAL_EB_COMMITTED: AtomicI32 = AtomicI32::new(-1);
 
+/// One row of the GPUEB limit table, as `/proc/gpufreqv2/limit_table` prints
+/// it: `<id> <name> <priority> <ceiling> <floor> <c_enable> <f_enable>`. The
+/// ceiling and floor are indices into the firmware OPP ladder, not
+/// frequencies.
+#[derive(Clone, Debug)]
+struct GpuLimitRow {
+    id: i32,
+    name: String,
+    ceiling: i32,
+    floor: i32,
+    c_enable: i32,
+    f_enable: i32,
+}
+
+/// Read a proc file that is larger than the small node buffer. The GPUFREQ
+/// status dump is roughly 600 bytes and the limit table about 900, so both sit
+/// past the 256 byte window the small node reader uses. The `[PPM Ceiling]`
+/// line alone is at offset 581 of the status dump, and it was silently cut
+/// off, which is why the enforced ceiling never parsed and the diagnostics
+/// always reported `ppm_ceiling=?`.
+fn gpu_read_proc_file(path: &str, capacity: usize) -> Option<String> {
+    use std::io::Read;
+    let mut file = fs::File::open(path).ok()?;
+    let mut buf = Vec::with_capacity(capacity);
+    file.read_to_end(&mut buf).ok()?;
+    if buf.is_empty() {
+        return None;
+    }
+    String::from_utf8(buf).ok()
+}
+
+/// Parse one row of the limit table dump. The header line starts with `[id]`
+/// and is rejected by the integer parse.
+fn parse_gpu_limit_row(line: &str) -> Option<GpuLimitRow> {
+    let mut parts = line.split_whitespace();
+    let id: i32 = parts.next()?.parse().ok()?;
+    let name = parts.next()?.to_string();
+    let _priority: i32 = parts.next()?.parse().ok()?;
+    let ceiling: i32 = parts.next()?.parse().ok()?;
+    let floor: i32 = parts.next()?.parse().ok()?;
+    let c_enable: i32 = parts.next()?.parse().ok()?;
+    let f_enable: i32 = parts.next()?.parse().ok()?;
+    Some(GpuLimitRow {
+        id,
+        name,
+        ceiling,
+        floor,
+        c_enable,
+        f_enable,
+    })
+}
+
+/// The live limit table. Reading it back is the only way to know whether a
+/// write to the node actually took effect: the node's write format is not
+/// documented, and a format the firmware accepts but ignores leaves the GPU
+/// capped while every other readback looks correct.
+fn gpu_limit_table_rows() -> Vec<GpuLimitRow> {
+    gpu_read_proc_file(GPU_LIMIT_TABLE, 16 * 1024)
+        .map(|raw| {
+            raw.lines()
+                .filter_map(parse_gpu_limit_row)
+                .collect::<Vec<GpuLimitRow>>()
+        })
+        .unwrap_or_default()
+}
+
+/// The limit-table row with the given id, if the table is readable.
+fn gpu_limit_row(id: i32) -> Option<GpuLimitRow> {
+    gpu_limit_table_rows().into_iter().find(|row| row.id == id)
+}
+
+/// Whether the given row's ceiling is currently enforced.
+fn gpu_limit_ceiling_enabled(id: i32) -> Option<bool> {
+    gpu_limit_row(id).map(|row| row.c_enable != 0)
+}
+
+/// A one-line summary of the limit table for the field log: every row with a
+/// real ceiling or floor, its name, the index it caps at, the frequency that
+/// index resolves to, and whether the ceiling and the floor are enforced.
+fn gpu_limit_table_summary() -> String {
+    let table = live_gpu_opp_table();
+    let rows = gpu_limit_table_rows();
+    if rows.is_empty() {
+        return "?".into();
+    }
+    let resolve = |index: i32| {
+        table
+            .and_then(|t| {
+                t.iter()
+                    .find(|(opp, _)| *opp == index)
+                    .map(|(_, khz)| *khz / 1000)
+            })
+            .map(|mhz| format!("{mhz}MHz"))
+            .unwrap_or_else(|| "?".into())
+    };
+    let parts: Vec<String> = rows
+        .iter()
+        .filter(|row| row.ceiling >= 0 || row.floor >= 0)
+        .map(|row| {
+            let ceiling = if row.ceiling >= 0 {
+                format!(
+                    "c{}=idx{}={}",
+                    row.c_enable,
+                    row.ceiling,
+                    resolve(row.ceiling)
+                )
+            } else {
+                "c-".to_string()
+            };
+            let floor = if row.floor >= 0 {
+                format!("f{}=idx{}={}", row.f_enable, row.floor, resolve(row.floor))
+            } else {
+                "f-".to_string()
+            };
+            format!("{}:{}[{ceiling},{floor}]", row.id, row.name)
+        })
+        .collect();
+    if parts.is_empty() {
+        "no finite ceiling".into()
+    } else {
+        parts.join(" ")
+    }
+}
+
 /// Commit the GPUEB limit-table rows that own the GPU thermal ceilings.
 /// `THERMAL_EB` (id 5) carries the 1430 MHz EB ceiling and `THERMAL_AP`
 /// (id 4) the 1196 MHz AP ceiling; both are enabled in the stock table and the
 /// firmware takes the strictest of them, so both have to be lifted for the GPU
-/// to reach its 1612 MHz OPP. The rows' floor columns stay enabled: neither
-/// thermal row carries a floor, so the stock 338 MHz power floor is
-/// unaffected.
+/// to reach its 1612 MHz OPP.
+///
+/// The write is confirmed by reading the table back. The node prints seven
+/// columns but its write format is not documented, and the short form
+/// `<id> <c_enable> <f_enable>` is parsed by the firmware as
+/// `<id> <ceiling> <floor>`, which leaves `c_enable` untouched: the row stays
+/// enforced at its stored index and the GPU keeps running at 1430 MHz while
+/// every other readback says the profile is configured. The full column form
+/// is written first and the short form is only used as a fallback for a
+/// firmware that wants the other layout.
 fn write_gpu_limit_rows(ceiling_enabled: bool) -> Result<(), String> {
     let c_enable = if ceiling_enabled { 1 } else { 0 };
-    service_control::write(
-        GPU_LIMIT_TABLE,
-        format!("{GPU_LIMIT_THERMAL_EB} {c_enable} 1"),
-    )
-    .map_err(|error| format!("thermal unlock write failed: {error}"))?;
-    service_control::write(
-        GPU_LIMIT_TABLE,
-        format!("{GPU_LIMIT_THERMAL_AP} {c_enable} 1"),
-    )
-    .map_err(|error| format!("thermal unlock write failed: {error}"))?;
+    for id in [GPU_LIMIT_THERMAL_EB, GPU_LIMIT_THERMAL_AP] {
+        write_gpu_limit_row(id, c_enable)?;
+    }
+    Ok(())
+}
+
+/// Write one limit-table row and confirm the firmware took it. The row's own
+/// ceiling and floor are preserved: they are the ladder positions the thermal
+/// engine publishes, and rewriting them would move the cap the engine is
+/// asking for.
+fn write_gpu_limit_row(id: i32, c_enable: i32) -> Result<(), String> {
+    let write = |payload: String| -> Result<(), String> {
+        service_control::write(GPU_LIMIT_TABLE, payload)
+            .map_err(|error| format!("thermal unlock write failed: {error}"))
+    };
+
+    let full = match gpu_limit_row(id) {
+        Some(row) => format!("{id} {} {} {c_enable} 1", row.ceiling, row.floor),
+        None => format!("{id} 0 -1 {c_enable} 1"),
+    };
+    write(full.clone())?;
+    if gpu_limit_ceiling_enabled(id) == Some(c_enable != 0) {
+        return Ok(());
+    }
+
+    // The full column form was accepted but the row did not change. The
+    // firmware wants the short form after all.
+    write(format!("{id} {c_enable} 1"))?;
     Ok(())
 }
 
@@ -2057,27 +2206,14 @@ fn set_thermal_unlock(enable: bool) -> Result<(), String> {
     let committed = i32::from(!enable);
     if GPU_LIMIT_THERMAL_EB_COMMITTED.swap(committed, Ordering::AcqRel) != committed {
         diagnostics::log_event(format!(
-            "thermal unlock {} thermal_ceiling={}mhz ppm={}",
+            "thermal unlock {} thermal_ceiling={}mhz ppm_ceiling={}mhz limits={}",
             if enable { "on" } else { "off" },
             gpu_thermal_ceiling_mhz().unwrap_or(-1),
-            gpu_ppm_ceiling_summary(),
+            gpu_ppm_ceiling_mhz().unwrap_or(-1),
+            gpu_limit_table_summary(),
         ));
     }
     Ok(())
-}
-
-/// The GPUFREQ `[PPM Ceiling]` line (`LimitIndex: N, Limiter: M, Priority: P`)
-/// names which limiter is clamping the GPU right now. Logged beside the thermal
-/// unlock so a field report shows whether the ceiling actually lifted.
-fn gpu_ppm_ceiling_summary() -> String {
-    let Some(status) = gpu_read_raw("/proc/gpufreqv2/gpufreq_status") else {
-        return "?".into();
-    };
-    status
-        .lines()
-        .find(|line| line.contains("PPM Ceiling"))
-        .map(|line| line.trim().to_string())
-        .unwrap_or_else(|| "?".into())
 }
 
 fn profile_uses_ged_boost(profile: i32) -> bool {
@@ -5123,6 +5259,7 @@ fn gaming_dynamic_guard() {
     let mut smoothed_load = 0;
     let mut boost_until = Instant::now();
     let mut last_drift_reassert = Instant::now();
+    let mut last_drift_log = Instant::now();
     let mut last_target_log = Instant::now();
     let mut last_beast_log = Instant::now();
     let mut last_thermal_reassert = Instant::now();
@@ -5219,15 +5356,23 @@ fn gaming_dynamic_guard() {
         let ladder_drifted = matches!(profile, 1 | 2) && !gpu_profile_stable_matches(profile);
         if ladder_drifted && last_drift_reassert.elapsed() >= Duration::from_millis(500) {
             last_drift_reassert = Instant::now();
-            diagnostics::log_event(format!(
-                "gpu profile {profile} drifted (min={} max={} governor={} policy={} dvfs={} ged={}); reassert",
-                gpu_get_min_freq_mhz(),
-                gpu_get_max_freq_mhz(),
-                gpu_get_governor(),
-                gpu_get_power_policy(),
-                gpu_get_dvfs_enabled(),
-                gpu_get_ged_boost(),
-            ));
+            // The reassert runs on its own cadence, but the log is rate
+            // limited: a node the vendor keeps reclaiming would otherwise
+            // write the same line twice a second for as long as the profile
+            // stayed selected, and the field log is where a real event has to
+            // be findable.
+            if last_drift_log.elapsed() >= Duration::from_millis(30000) {
+                last_drift_log = Instant::now();
+                diagnostics::log_event(format!(
+                    "gpu profile {profile} drifted (min={} max={} governor={} policy={} dvfs={} ged={}); reassert",
+                    gpu_get_min_freq_mhz(),
+                    gpu_get_max_freq_mhz(),
+                    gpu_get_governor(),
+                    gpu_get_power_policy(),
+                    gpu_get_dvfs_enabled(),
+                    gpu_get_ged_boost(),
+                ));
+            }
             reassert_gpu_profile_drift(profile);
         }
 
@@ -6293,16 +6438,19 @@ fn gpu_get_uncap_active() -> i32 {
 /// is `<temp_mC>,<ceiling_hz>,<floor_hz>`. This is the framework's published
 /// policy, not necessarily the cap the GPU is actually held to: the GPUEB
 /// firmware enforces the strictest enabled row of its own limit table, and
-/// that row is the effective ceiling. Returns the published ceiling in MHz, or
-/// `None` when the node is unavailable.
+/// that row is the effective ceiling.
+///
+/// A published ceiling below the lowest OPP is the deep-idle marker the
+/// framework emits when the GPU is clock gated, not a real cap, so it is
+/// ignored rather than reported as a one megahertz limit.
 fn gpu_thermal_ceiling_mhz() -> Option<i32> {
     let raw = gpu_read_raw("/sys/kernel/thermal/gpu_info")?;
-    raw.split(',')
-        .nth(1)?
-        .trim()
-        .parse::<i64>()
-        .ok()
-        .map(|hz| (hz / 1_000_000) as i32)
+    let hz = raw.split(',').nth(1)?.trim().parse::<i64>().ok()?;
+    let mhz = (hz / 1_000_000) as i32;
+    if mhz > 0 && mhz < GPU_MIN_FREQ_MHZ {
+        return None;
+    }
+    Some(mhz)
 }
 
 /// The ceiling the GPUEB firmware is actually enforcing, read from the live
@@ -6312,7 +6460,7 @@ fn gpu_thermal_ceiling_mhz() -> Option<i32> {
 /// that explains a "the GPU never reaches 1612 MHz" report, because it names
 /// the row that is holding the clock down.
 fn gpu_ppm_ceiling_mhz() -> Option<i32> {
-    let status = gpu_read_raw("/proc/gpufreqv2/gpufreq_status")?;
+    let status = gpu_read_proc_file("/proc/gpufreqv2/gpufreq_status", 64 * 1024)?;
     let index = parse_ppm_ceiling_index(&status)?;
     let table = live_gpu_opp_table()?;
     table
@@ -6380,7 +6528,7 @@ fn beast_gpu_state() -> String {
         .unwrap_or_else(|| "?".into())
     };
     format!(
-        "cur={} min={} max={} gov={} policy={} dvfs={} boost_level={} floor={} ceiling={} ged={} thermal_ceiling={} ppm_ceiling={} effective_ceiling={}",
+        "cur={} min={} max={} gov={} policy={} dvfs={} boost_level={} floor={} ceiling={} ged={} thermal_ceiling={} ppm_ceiling={} effective_ceiling={} limits={}",
         gpu_get_cur_freq_mhz(),
         gpu_get_min_freq_mhz(),
         gpu_get_max_freq_mhz(),
@@ -6400,6 +6548,7 @@ fn beast_gpu_state() -> String {
         gpu_effective_ceiling_mhz()
             .map(|mhz| format!("{mhz}MHz"))
             .unwrap_or_else(|| "?".into()),
+        gpu_limit_table_summary(),
     )
 }
 
@@ -6505,6 +6654,19 @@ fn reassert_gpu_profile_drift(profile: i32) {
     }
 }
 
+/// The devfreq governor names a profile accepts. The MediaTek power service
+/// installs `dummy` whenever it takes the GPU back, and on this SoC the
+/// governor name does not drive the GED OPP policy anyway -- the boost target
+/// and the ceiling do. So `dummy` is the platform's own value rather than a
+/// fault: requiring a profile's own name made the guard fight the power
+/// service over a label, report a working profile as failed, and fill the
+/// field log with the same line twice a second. Any other name is a residue
+/// from a different profile and is still drift. Extreme Beast is excluded by
+/// its own arm: it freezes DVFS, so the governor is part of the locked state.
+fn governor_matches(expected: &str, live: &str) -> bool {
+    live == expected || live == "dummy"
+}
+
 fn gpu_profile_verified(profile: i32) -> bool {
     let min = gpu_get_min_freq_mhz();
     let max = gpu_get_max_freq_mhz();
@@ -6525,7 +6687,7 @@ fn gpu_profile_verified(profile: i32) -> bool {
         1 => {
             min == 338
                 && max == 1612
-                && governor == "simple_ondemand"
+                && governor_matches("simple_ondemand", &governor)
                 && gpu_boost_pipeline_matches(true)
                 && dvfs == 1
                 && power_policy == "always_on"
@@ -6533,7 +6695,7 @@ fn gpu_profile_verified(profile: i32) -> bool {
         2 => {
             min == 338
                 && max == 598
-                && governor == "powersave"
+                && governor_matches("powersave", &governor)
                 && gpu_boost_pipeline_matches(false)
                 && dvfs == 1
                 && power_policy == "coarse_demand"
@@ -6599,7 +6761,7 @@ fn gpu_profile_matches_reading(
         1 => {
             min == 338
                 && (max == 1612 || (thermal_limited && (338..1612).contains(&max)))
-                && governor == "simple_ondemand"
+                && governor_matches("simple_ondemand", governor)
                 && ged_ok(true)
                 && dvfs == 1
                 && power_policy == "always_on"
@@ -6607,7 +6769,7 @@ fn gpu_profile_matches_reading(
         2 => {
             min == 338
                 && (max == 598 || (thermal_limited && max < 598))
-                && governor == "powersave"
+                && governor_matches("powersave", governor)
                 && ged_ok(false)
                 && dvfs == 1
                 && power_policy == "coarse_demand"
@@ -8235,9 +8397,9 @@ pub fn serve_client(stream: UnixStream) {
 #[cfg(test)]
 mod tests {
     use super::{
-        GPU_UNCAPPED_ARMED, GpuReadings, beast_lock_ready, boost_target_drifted,
-        gpu_profile_matches, gpu_profile_matches_reading, gpu_uncap_armed, parse_ppm_ceiling_index,
-        per_app_gpu_override_active, set_per_app_gpu_override,
+        GPU_UNCAPPED_ARMED, GpuLimitRow, GpuReadings, beast_lock_ready, boost_target_drifted,
+        gpu_profile_matches, gpu_profile_matches_reading, gpu_uncap_armed, parse_gpu_limit_row,
+        parse_ppm_ceiling_index, per_app_gpu_override_active, set_per_app_gpu_override,
     };
 
     fn readings<'a>(
@@ -8407,6 +8569,28 @@ mod tests {
         // A real node drift is still caught.
         let drifted = readings(338, 1612, "powersave", 1, "coarse_demand", 900);
         assert!(!gpu_profile_matches_reading(2, &drifted, false, None));
+    }
+
+    #[test]
+    fn the_platform_dummy_governor_is_not_a_profile_fault() {
+        // Live field failure: the MediaTek power service installs `dummy`
+        // whenever it takes the GPU back. Requiring the profile's own
+        // governor name made the guard reassert every 500 ms against a
+        // vendor it could not win, reported a working profile as failed, and
+        // wrote the same field log line twice a second. The governor name is
+        // inert on this SoC -- the boost target and the ceiling drive the
+        // clock -- so `dummy` is the platform's own value.
+        let platform = readings(338, 598, "dummy", 1, "coarse_demand", 338);
+        assert!(gpu_profile_matches_reading(2, &platform, false, None));
+        let gaming = readings(338, 1612, "dummy", 1, "always_on", 800);
+        assert!(gpu_profile_matches_reading(1, &gaming, false, None));
+        // A residue from another profile is still drift.
+        let residue = readings(338, 1612, "performance", 1, "always_on", 800);
+        assert!(!gpu_profile_matches_reading(1, &residue, false, None));
+        // Extreme Beast freezes DVFS, so its governor is part of the lock and
+        // stays a strict check: the platform default is not enough there.
+        let beast = readings(1612, 1612, "dummy", 0, "always_on", 1612);
+        assert!(!gpu_profile_matches_reading(3, &beast, false, None));
     }
 
     #[test]
@@ -8686,6 +8870,55 @@ io.github.neeschal.dashessential 10228 0 /data/user/0/io.github.neeschal.dashess
         assert_eq!(cpu_frequency_drift_status(-1, -1, 300, 2100), -1);
         assert_eq!(cpu_frequency_drift_status(1200, 1800, 1200, 1800), 0);
         assert_eq!(cpu_frequency_drift_status(1800, 1800, 1200, 1800), 1);
+    }
+
+    #[test]
+    fn parses_the_gpu_limit_table_rows() {
+        // The live dump on Dash. The ceiling column is an OPP index, not a
+        // frequency: THERMAL_EB caps at index 7 (1430 MHz) and THERMAL_AP at
+        // index 35 (1196 MHz).
+        let table = "[id]          [name]  [priority]  [ceiling]  [floor]  [c_enable]  [f_enable]\n\
+   0         SEGMENT           9          0       51           1           1\n\
+   4      THERMAL_AP           6         35       -1           1           1\n\
+   5      THERMAL_EB           6          7       -1           1           1\n\
+  12        POWERHAL           2          0       51           1           1\n";
+        let rows: Vec<GpuLimitRow> = table.lines().filter_map(parse_gpu_limit_row).collect();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].id, 0);
+        assert_eq!(rows[0].name, "SEGMENT");
+        assert_eq!(rows[0].ceiling, 0);
+        assert_eq!(rows[0].floor, 51);
+        assert_eq!(rows[0].c_enable, 1);
+        assert_eq!(rows[0].f_enable, 1);
+        assert_eq!(rows[1].id, 4);
+        assert_eq!(rows[1].name, "THERMAL_AP");
+        assert_eq!(rows[1].ceiling, 35);
+        assert_eq!(rows[1].floor, -1);
+        assert_eq!(rows[2].id, 5);
+        assert_eq!(rows[2].name, "THERMAL_EB");
+        assert_eq!(rows[2].ceiling, 7);
+        // The header line is not a row.
+        assert!(
+            parse_gpu_limit_row("[id] [name] [priority] [ceiling] [floor] [c_enable] [f_enable]")
+                .is_none()
+        );
+        assert!(parse_gpu_limit_row("").is_none());
+    }
+
+    #[test]
+    fn the_limit_table_ceiling_indices_resolve_to_the_documented_frequencies() {
+        // THERMAL_EB's ceiling index 7 and THERMAL_AP's index 35 are the two
+        // caps that hold the GPU below its 1612 MHz OPP on this SoC.
+        let table = dash_working_opp_table();
+        let resolve = |index: i32| {
+            table
+                .iter()
+                .find(|(opp_index, _)| *opp_index == index)
+                .map(|(_, freq_khz)| freq_khz / 1000)
+        };
+        assert_eq!(resolve(7), Some(1430));
+        assert_eq!(resolve(35), Some(1196));
+        assert_eq!(resolve(0), Some(1612));
     }
 
     #[test]

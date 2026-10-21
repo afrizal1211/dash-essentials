@@ -106,6 +106,40 @@ original wording.
   alongside the zip and APK so the updater never has to trust a bare
   download.
 
+## 1.18.14
+
+Codename: Rigel.
+
+- The thermal ceiling write now actually takes effect. The limit table prints
+  seven columns (`id`, `name`, `priority`, `ceiling`, `floor`, `c_enable`,
+  `f_enable`) but the write was sent in the short three-field form, which the
+  firmware parses as `id`, `ceiling` and `floor`: `c_enable` was never
+  changed, the row stayed enforced at its stored index, and the GPU kept
+  running at the 1430 MHz plateau while every other readback said the profile
+  was configured. The full column form is written now, and the write is
+  confirmed by reading the table back, so a firmware that wants the other
+  layout is still handled.
+- The limit table is read back and reported in the field log, naming the row
+  that is actually holding the clock down together with the index it caps at
+  and the frequency that index resolves to. The enforced ceiling now comes
+  from the live `[PPM Ceiling]` line, which sits at offset 581 of the
+  GPUFREQ status dump and was being cut off by the small node buffer, so the
+  diagnostics always reported an unknown ceiling.
+- A published thermal ceiling below the lowest OPP is the deep-idle marker the
+  framework emits for a clock-gated GPU, not a one megahertz cap. It is
+  ignored now, which stops the diagnostics from reporting an idle GPU as
+  thermally capped.
+- The MediaTek power service's own `dummy` governor is no longer treated as a
+  profile fault. Requiring a profile's own governor name made the guard
+  reassert every 500 ms against a vendor it could not win, reported a working
+  profile as failed in the diagnostics, and wrote the same field log line
+  twice a second. The governor name is inert on this SoC, so the boost target
+  and the ceiling are what the profile is judged on. Extreme Beast keeps the
+  strict check: it freezes DVFS, so the governor is part of the locked state.
+- The profile drift log is rate limited to one line every 30 seconds. The
+  reassert keeps its own cadence, so a node the vendor keeps reclaiming can no
+  longer bury every other event in the field log.
+
 ## 1.18.13
 
 Codename: Lyra.
