@@ -260,6 +260,17 @@ jobs:
             echo "no CHANGELOG section for $version; notes left without it" >&2
           fi
 
+          # A release whose CHANGELOG section is marked "Pre-release" is
+          # published as a GitHub pre-release, so it is not handed to users as
+          # the latest stable one. The flag is set explicitly in both
+          # directions: without it a release that used to be a pre-release
+          # would keep the flag when it is re-published.
+          prerelease_flag=--prerelease=false
+          if printf '%s\n' "$changelog" | grep -qi 'pre-release'; then
+            prerelease_flag=--prerelease
+            echo "publishing $GITHUB_REF_NAME as a pre-release" >&2
+          fi
+
           cat >> "$RUNNER_TEMP/notes.md" <<'NOTES'
           ### Verify the download
 
@@ -281,13 +292,15 @@ jobs:
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release edit "$GITHUB_REF_NAME" \
               --title "Dash Essential $GITHUB_REF_NAME" \
-              --notes-file "$RUNNER_TEMP/notes.md"
+              --notes-file "$RUNNER_TEMP/notes.md" \
+              "$prerelease_flag"
             gh release upload "$GITHUB_REF_NAME" --clobber \
               "${zip[@]}" "${sum[@]}" "${apk[@]}" "${apk[0]}.sha256"
           else
             gh release create "$GITHUB_REF_NAME" --verify-tag \
               --title "Dash Essential $GITHUB_REF_NAME" \
               --notes-file "$RUNNER_TEMP/notes.md" \
+              "$prerelease_flag" \
               "${zip[@]}" "${sum[@]}" "${apk[@]}" "${apk[0]}.sha256"
           fi
 
