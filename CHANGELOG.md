@@ -106,6 +106,37 @@ original wording.
   alongside the zip and APK so the updater never has to trust a bare
   download.
 
+## 1.18.15
+
+Codename: Spica. **Pre-release.** The GPU frequency reporting and the thermal
+ceiling are now measured rather than assumed, and the daemon stops claiming a
+ceiling it cannot lift. The clock behaviour itself is not yet settled: this
+release exists to get a field log that shows the real clock next to the
+requested one.
+
+- The live GPU clock now comes from the GPUFREQ status dump's measured clock
+  (`[GPU   REALOPP]`) instead of GED's `current_freqency` node. That node
+  reports the nominal frequency of the OPP the vendor's power HAL last
+  requested, not the clock the hardware ended up at: with the daemon holding
+  the devfreq floor at 338 MHz the node kept reading `51 338000` while the
+  status dump showed `OutFreq: 583882`, so the dashboard reported 338 MHz for a
+  GPU that was running at 583 MHz. The field log now prints the measured
+  clock, GED's nominal reading and the requested OPP side by side, so a "stuck
+  at 338 MHz" report can be checked against what the GPU really did.
+- The thermal ceiling is verified instead of assumed. `/proc/gpufreqv2/limit_table`
+  accepts the write -- the driver returns the byte count -- but on this ROM the
+  row never changes: fifteen write formats were tried on the device, including
+  the short `<id> <up_enable> <low_enable>` form the community MTK GPUEB unlock
+  uses for every row, and the readback was byte-identical afterwards. The table
+  is owned by the vendor's power HAL. The daemon now checks the enforced
+  ceiling before and after the write, refuses to record an unlock that did not
+  happen, and the app says the vendor service owns the table instead of
+  claiming a ceiling was raised.
+- The limit table is read back and reported in the field log, naming every row
+  that carries a limit, the index it caps at and the frequency that index
+  resolves to. The enforced ceiling is taken from the live `[PPM Ceiling]`
+  line, which names the row that is actually holding the clock down.
+
 ## 1.18.14
 
 Codename: Rigel.

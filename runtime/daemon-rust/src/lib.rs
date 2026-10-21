@@ -2169,6 +2169,26 @@ fn write_gpu_limit_row(id: i32, c_enable: i32) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether the thermal ceiling rows can be lifted at all on this build.
+///
+/// `/proc/gpufreqv2/limit_table` accepts the write -- the driver returns the
+/// byte count -- but on this ROM the row never changes: fifteen formats were
+/// tried on the device, including the short `<id> <up_enable> <low_enable>`
+/// form the community MTK GPUEB unlock uses for every row, and the readback
+/// was identical afterwards. The table is owned by the vendor's power HAL.
+///
+/// So the write is attempted and then *verified against the live effective
+/// ceiling*. A build that honours it gets a lifted ceiling; a build that
+/// ignores it is reported as such instead of the daemon claiming a ceiling
+/// it never lifted.
+fn gpu_limit_rows_are_writable() -> bool {
+    if let Some(row) = gpu_limit_row(GPU_LIMIT_THERMAL_EB) {
+        // The readback has to move for the write to have had any effect.
+        return row.c_enable == 0;
+    }
+    false
+}
+
 /// Re-assert the lifted thermal ceilings without touching the persisted state
 /// or the diagnostics log. The vendor stack re-arms the rows behind the
 /// daemon's back, so the background guard repeats this write on a slow
@@ -2185,6 +2205,19 @@ fn reassert_thermal_ceiling_stock() {
     let _ = write_gpu_limit_rows(true);
 }
 
+/// Attempt to lift the thermal ceilings and report whether the enforced
+/// ceiling actually moved. The profile path uses this instead of
+/// `set_thermal_unlock`, so a build whose vendor power HAL owns the limit
+/// table does not end up with a persisted "unlocked" flag that is not true.
+fn try_lift_thermal_ceiling() -> bool {
+    let before = gpu_effective_ceiling_mhz();
+    let _ = write_gpu_limit_rows(false);
+    if gpu_limit_rows_are_writable() {
+        return true;
+    }
+    gpu_effective_ceiling_mhz() != before
+}
+
 /// Enable or lift the stock thermal ceilings that hold the GPU below its
 /// 1612 MHz OPP. Format is `<id> <c_enable> <f_enable>`, matching the limit
 /// table's own columns; the community GED tuners use the same node.
@@ -2195,7 +2228,20 @@ fn reassert_thermal_ceiling_stock() {
 /// matter what the GED and devfreq nodes say. The GPU's own hardware thermal
 /// trip and the platform's CPU thermal zones are untouched by this.
 fn set_thermal_unlock(enable: bool) -> Result<(), String> {
+    let before = gpu_effective_ceiling_mhz();
     write_gpu_limit_rows(!enable)?;
+    let after = gpu_effective_ceiling_mhz();
+    // The write is only a lift if the enforced ceiling actually moved. On a
+    // build whose power HAL owns the table the write is accepted and ignored,
+    // and reporting success there would tell the user a ceiling was lifted
+    // that is still in force.
+    if enable && before == after && !gpu_limit_rows_are_writable() {
+        return Err(
+            "the GPUFREQ limit table is owned by the vendor power HAL on this build; \
+             the thermal ceiling cannot be lifted"
+                .into(),
+        );
+    }
     mutate_persisted_state(|state| {
         state.thermal_unlock = if enable { 1 } else { 0 };
     })?;
@@ -2469,6 +2515,16 @@ pub fn apply_performance_profile(profile: i32) -> Result<(), String> {
 
     let result = apply_performance_profile_hardware(profile);
 
+    // The profile owns the thermal ceiling, but only a lift that the driver
+    // actually honoured is recorded. On a build whose vendor power HAL owns
+    // the limit table the write is accepted and ignored, and persisting an
+    // "unlocked" flag there would tell the UI a ceiling was lifted that is
+    // still in force.
+    let thermal_lifted = match profile {
+        2 => false,
+        _ => try_lift_thermal_ceiling(),
+    };
+
     // Only the global profile is persisted. A per-app override drives the
     // hardware through `apply_performance_profile_hardware` directly and never
     // reaches here, so it can never rewrite the user's global choice.
@@ -2484,8 +2540,9 @@ pub fn apply_performance_profile(profile: i32) -> Result<(), String> {
             state.gpu_power_policy = "always_on".to_string();
             state.gpu_profile_cpu_isolated = 1;
             // The profile owns the thermal ceiling: the 1612 MHz OPP is only
-            // reachable with the MTK ceiling rows lifted.
-            state.thermal_unlock = 1;
+            // reachable with the MTK ceiling rows lifted, and only a lift the
+            // driver honoured is recorded.
+            state.thermal_unlock = i32::from(thermal_lifted);
         }),
         1 => mutate_persisted_state(|state| {
             state.perf = 1;
@@ -2498,8 +2555,9 @@ pub fn apply_performance_profile(profile: i32) -> Result<(), String> {
             state.gpu_power_policy = "always_on".to_string();
             state.gpu_profile_cpu_isolated = 1;
             // The profile owns the thermal ceiling: the 1612 MHz OPP is only
-            // reachable with the MTK ceiling rows lifted.
-            state.thermal_unlock = 1;
+            // reachable with the MTK ceiling rows lifted, and only a lift the
+            // driver honoured is recorded.
+            state.thermal_unlock = i32::from(thermal_lifted);
         }),
         2 => mutate_persisted_state(|state| {
             state.perf = 2;
@@ -2527,7 +2585,7 @@ pub fn apply_performance_profile(profile: i32) -> Result<(), String> {
             state.gpu_profile_cpu_isolated = 1;
             // Stock Balanced still asks for the 1612 MHz OPP, so it needs the
             // thermal ceilings lifted as well.
-            state.thermal_unlock = 1;
+            state.thermal_unlock = i32::from(thermal_lifted);
         }),
     };
     persistence?;
@@ -6326,10 +6384,59 @@ fn parse_ged_current_frequency_mhz(raw: &str) -> Option<i32> {
     }
 }
 
+/// The clock the GPU is actually running at, read from the GPUFREQ status
+/// dump's `[GPU   REALOPP]` line.
+///
+/// This is the only trustworthy live clock on this SoC. GED's
+/// `current_freqency` node reports the *nominal* frequency of the OPP the
+/// power HAL last requested, not the clock the hardware ended up at: with the
+/// daemon holding the devfreq floor at 338 MHz the node kept reading
+/// `51 338000` while the status dump showed `OutFreq: 583882` -- the GPU was
+/// running at 583 MHz and the dashboard insisted on 338 MHz. The metered
+/// clock (`FmeterFreq`) is preferred because it is the measured value; it
+/// reads zero while the GPU is clock gated, in which case the commanded
+/// `OutFreq` is the best available answer.
+fn gpu_get_real_cur_freq_mhz() -> Option<i32> {
+    let status = gpu_read_proc_file("/proc/gpufreqv2/gpufreq_status", 64 * 1024)?;
+    let line = status.lines().find(|line| line.contains("GPU   REALOPP"))?;
+    let field = |name: &str| -> Option<i64> {
+        let after = line.split(name).nth(1)?;
+        after.split(',').next()?.trim().parse::<i64>().ok()
+    };
+    let metered = field("FmeterFreq:").unwrap_or(0);
+    let commanded = field("OutFreq:").unwrap_or(0);
+    let khz = if metered > 0 { metered } else { commanded };
+    if khz <= 0 {
+        return None;
+    }
+    Some((khz / 1000) as i32)
+}
+
+/// The live GPU clock, cached briefly. The status dump is a few hundred bytes
+/// and the background guard reads the clock several times per tick, so the
+/// read is shared across a short window instead of hitting the proc file on
+/// every call.
+fn gpu_get_real_cur_freq_cached_mhz() -> Option<i32> {
+    static CACHE: OnceLock<Mutex<(Instant, Option<i32>)>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new((Instant::now(), None)));
+    let mut guard = cache.lock().ok()?;
+    if guard.0.elapsed() < Duration::from_millis(50) {
+        return guard.1;
+    }
+    let value = gpu_get_real_cur_freq_mhz();
+    *guard = (Instant::now(), value);
+    value
+}
+
 fn gpu_get_cur_freq_mhz() -> i32 {
-    // MediaTek GED reports the active OPP (for example `51 338000`). The
-    // generic devfreq node can expose a 26 MHz deep-idle clock instead, which
-    // is useful for power debugging but not the live OPP selected by GED.
+    // The measured clock first: it is what the hardware is actually doing.
+    if let Some(mhz) = gpu_get_real_cur_freq_cached_mhz() {
+        return mhz;
+    }
+    // MediaTek GED reports the requested OPP (for example `51 338000`). This
+    // is the nominal frequency of the OPP the power HAL asked for, which can
+    // be well below the clock the GPU is really running at, so it is only a
+    // fallback for a device where the status dump cannot be read.
     if let Some(mhz) = gpu_read_raw("/sys/kernel/ged/hal/current_freqency")
         .as_deref()
         .and_then(parse_ged_current_frequency_mhz)
@@ -6528,8 +6635,12 @@ fn beast_gpu_state() -> String {
         .unwrap_or_else(|| "?".into())
     };
     format!(
-        "cur={} min={} max={} gov={} policy={} dvfs={} boost_level={} floor={} ceiling={} ged={} thermal_ceiling={} ppm_ceiling={} effective_ceiling={} limits={}",
+        "cur={} real_cur={} ged_nominal={} min={} max={} gov={} policy={} dvfs={} boost_level={} floor={} ceiling={} ged={} thermal_ceiling={} ppm_ceiling={} effective_ceiling={} limits={}",
         gpu_get_cur_freq_mhz(),
+        gpu_get_real_cur_freq_mhz().unwrap_or(-1),
+        gpu_read_raw("/sys/kernel/ged/hal/current_freqency")
+            .map(|raw| raw.split_whitespace().last().unwrap_or("?").to_string())
+            .unwrap_or_else(|| "?".into()),
         gpu_get_min_freq_mhz(),
         gpu_get_max_freq_mhz(),
         gpu_get_governor(),

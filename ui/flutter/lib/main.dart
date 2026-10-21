@@ -12632,6 +12632,22 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
     DashHaptics.confirm();
     setState(() => _optimisticThermalUnlock = enabled);
 
+    // The daemon verifies the lift against the enforced ceiling and refuses
+    // when the driver ignored the write. On a build whose vendor power HAL
+    // owns the GPUFREQ limit table the ceiling cannot be lifted at all, and
+    // saying it was would be a lie the next field log would contradict.
+    final bool applied = DashBackend.instance.setGpuThermalUnlock(enabled);
+    if (!applied) {
+      setState(() => _optimisticThermalUnlock = null);
+      _showGlassToast(
+        'THERMAL CEILING',
+        'The vendor service owns the GPUFREQ limit table on this build',
+        Icons.lock_rounded,
+        const Color(0xFF67C2FF),
+      );
+      return;
+    }
+
     _showGlassToast(
       'THERMAL CEILING',
       enabled
@@ -12641,7 +12657,6 @@ class _MaliGpuScreenState extends State<MaliGpuScreen> {
       enabled ? const Color(0xFFFFB84D) : const Color(0xFF67C2FF),
     );
 
-    DashBackend.instance.setGpuThermalUnlock(enabled);
     Future<void>.delayed(const Duration(milliseconds: 500), () {
       DashBackend.instance.refresh();
       if (mounted) {
