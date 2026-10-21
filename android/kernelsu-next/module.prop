@@ -1,6 +1,6 @@
 id=nees_dash_essential_backend
 name=Dash Essential
-version=v1.18.18
-versionCode=11818
+version=v1.18.19
+versionCode=11819
 author=NEESCHAL-3 (original Rodin Essential), afrizal1221 (MT6991 dash port)
 description=KernelSU Next and Magisk package for Dash Essential, the MT6991 (dash) port of NEESCHAL-3's Rodin Essential. Keeps the Android app non-root and runs hardware controls through an authenticated root daemon.

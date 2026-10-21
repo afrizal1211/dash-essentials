@@ -2427,16 +2427,8 @@ pub fn enforce_performance_profile(profile: i32) -> bool {
             // load, so the GPU scales instead of sitting at the minimum. Both
             // are published the way MediaTek's own tooling does it: the ladder
             // index on the GED node and the frequency on the module parameter.
-            write_ged_opp_index(GPU_BOOST_TARGET_NODE, GPU_MIN_FREQ_MHZ, FreqBound::AtLeast);
+            write_gpu_floor(GPU_MIN_FREQ_MHZ);
             let _ = service_control::write(GPU_CEILING_NODE, "0");
-            let _ = service_control::write(
-                "/sys/module/ged/parameters/gpu_bottom_freq",
-                format!("{}", GPU_MIN_FREQ_MHZ * 1_000),
-            );
-            let _ = service_control::write(
-                "/sys/module/ged/parameters/gpu_cust_boost_freq",
-                format!("{}", GPU_MIN_FREQ_MHZ * 1_000),
-            );
             let _ = service_control::write(
                 "/sys/module/ged/parameters/gpu_cust_upbound_freq",
                 "1612000",
@@ -2470,16 +2462,8 @@ pub fn enforce_performance_profile(profile: i32) -> bool {
             // The floor is the 338 MHz minimum and the ceiling is the 598 MHz
             // cap, published the way MediaTek's own tooling does it: the ladder
             // index on the GED node and the frequency on the module parameter.
-            write_ged_opp_index(GPU_BOOST_TARGET_NODE, GPU_MIN_FREQ_MHZ, FreqBound::AtLeast);
+            write_gpu_floor(GPU_MIN_FREQ_MHZ);
             write_ged_opp_index(GPU_CEILING_NODE, GPU_BATTERY_CEILING_MHZ, FreqBound::AtMost);
-            let _ = service_control::write(
-                "/sys/module/ged/parameters/gpu_bottom_freq",
-                format!("{}", GPU_MIN_FREQ_MHZ * 1_000),
-            );
-            let _ = service_control::write(
-                "/sys/module/ged/parameters/gpu_cust_boost_freq",
-                format!("{}", GPU_MIN_FREQ_MHZ * 1_000),
-            );
             let _ = service_control::write(
                 "/sys/module/ged/parameters/gpu_cust_upbound_freq",
                 format!("{}", GPU_BATTERY_CEILING_MHZ * 1_000),
@@ -2515,16 +2499,8 @@ pub fn enforce_performance_profile(profile: i32) -> bool {
             // The floor is the 338 MHz minimum and the ceiling is the fastest
             // OPP. Stock hands live scaling to the vendor power HAL and only
             // needs the full ladder available.
-            write_ged_opp_index(GPU_BOOST_TARGET_NODE, GPU_MIN_FREQ_MHZ, FreqBound::AtLeast);
+            write_gpu_floor(GPU_MIN_FREQ_MHZ);
             let _ = service_control::write(GPU_CEILING_NODE, "0");
-            let _ = service_control::write(
-                "/sys/module/ged/parameters/gpu_bottom_freq",
-                format!("{}", GPU_MIN_FREQ_MHZ * 1_000),
-            );
-            let _ = service_control::write(
-                "/sys/module/ged/parameters/gpu_cust_boost_freq",
-                format!("{}", GPU_MIN_FREQ_MHZ * 1_000),
-            );
             let _ = service_control::write(
                 "/sys/module/ged/parameters/gpu_cust_upbound_freq",
                 "1612000",
@@ -5552,7 +5528,7 @@ fn gaming_dynamic_guard() {
         // computed target happened to be unchanged. Reading it back costs one
         // small node read per tick and guarantees drift is corrected.
         if gpu_ged_floor_index() != Some(target_floor) {
-            let _ = service_control::write(GPU_BOOST_TARGET_NODE, target_floor.to_string());
+            write_gpu_floor(target_floor);
         }
 
         drop(profile_guard);
@@ -6129,6 +6105,34 @@ fn gpu_ged_floor_index() -> Option<i32> {
     gpu_ged_index(GPU_BOOST_TARGET_NODE)
 }
 
+/// The frequency a ladder index names, in kHz. The floor is published twice:
+/// as the ladder index on the GED node and as a frequency on the module
+/// parameters. The driver resolves the floor from both, so the two have to be
+/// written together or the clock never leaves the frequency the last one
+/// named.
+fn gpu_opp_index_khz(index: i32) -> Option<i32> {
+    live_gpu_opp_table()?
+        .iter()
+        .find(|(opp_index, _)| *opp_index == index)
+        .map(|(_, khz)| *khz)
+}
+
+/// Publish a floor: the ladder index on the GED node and the frequency on the
+/// module parameters.
+fn write_gpu_floor(index: i32) {
+    let _ = service_control::write(GPU_BOOST_TARGET_NODE, index.to_string());
+    if let Some(khz) = gpu_opp_index_khz(index) {
+        let _ = service_control::write(
+            "/sys/module/ged/parameters/gpu_bottom_freq",
+            khz.to_string(),
+        );
+        let _ = service_control::write(
+            "/sys/module/ged/parameters/gpu_cust_boost_freq",
+            khz.to_string(),
+        );
+    }
+}
+
 fn gpu_read_raw(path: &str) -> Option<String> {
     use std::io::Read;
     let mut f = fs::File::open(path).ok()?;
@@ -6157,13 +6161,21 @@ fn gpu_get_loading() -> i32 {
 /// dumps `g_shared_status->working_table_gpu`, which is the very table GED
 /// resolves its indices against, and both writable GED nodes take one of its
 /// indices: `custom_boost_gpu_freq` and `custom_upbound_gpu_freq`, with `0`
-/// meaning the fastest OPP. On this firmware the generic governor is inert, so
-/// the nodes are the live actuator: a low `custom_boost_gpu_freq` index *runs*
-/// the GPU low instead of merely permitting it. Profiles therefore hold that
-/// node open at index 0 and limit with `custom_upbound_gpu_freq`. Dash's ladder
-/// is not a uniform 26 MHz step -- 24 of its 52 indices all run at 1430 MHz --
-/// so an index is always resolved from the live table and never computed from a
-/// frequency.
+/// meaning the fastest OPP.
+///
+/// `custom_boost_gpu_freq` is the **floor**: the lowest OPP the GPU may not go
+/// below. It is published together with the floor's frequency on the
+/// `gpu_bottom_freq` / `gpu_cust_boost_freq` module parameters, and
+/// `custom_upbound_gpu_freq` is the ceiling, published with
+/// `gpu_cust_upbound_freq`. The MediaTek power service rewrites the floor node
+/// with its own stock value every couple of hundred milliseconds, which is
+/// benign -- its own floor is the ladder's bottom -- but a guard that compares
+/// against its own cache instead of the live node stops correcting the node
+/// altogether, and the clock stays where the vendor left it.
+///
+/// Dash's ladder is not a uniform 26 MHz step -- 24 of its 52 indices all run
+/// at 1430 MHz -- so an index is always resolved from the live table and never
+/// computed from a frequency.
 const GPU_MIN_FREQ_MHZ: i32 = 338;
 const GPU_BATTERY_CEILING_MHZ: i32 = 598;
 
@@ -7090,7 +7102,7 @@ fn set_gpu_uncap(enable: bool) -> Result<(), String> {
         // fastest OPP, published the way MediaTek's own tooling does it: the
         // ladder index on the GED node and the frequency on the module
         // parameter.
-        write_ged_opp_index(GPU_BOOST_TARGET_NODE, GPU_MIN_FREQ_MHZ, FreqBound::AtLeast);
+        write_gpu_floor(GPU_MIN_FREQ_MHZ);
         let _ = service_control::write(GPU_CEILING_NODE, "0");
         let _ = service_control::write("/sys/kernel/ged/hal/gpu_boost_level", "0");
         gpu_write_file(
@@ -7103,14 +7115,6 @@ fn set_gpu_uncap(enable: bool) -> Result<(), String> {
             "/sys/class/misc/mali0/device/devfreq/48000000.mali/max_freq",
             "1612000000",
         )?;
-        let _ = service_control::write(
-            "/sys/module/ged/parameters/gpu_bottom_freq",
-            format!("{}", GPU_MIN_FREQ_MHZ * 1_000),
-        );
-        let _ = service_control::write(
-            "/sys/module/ged/parameters/gpu_cust_boost_freq",
-            format!("{}", GPU_MIN_FREQ_MHZ * 1_000),
-        );
         let _ = service_control::write(
             "/sys/module/ged/parameters/gpu_cust_upbound_freq",
             "1612000",
@@ -8739,6 +8743,28 @@ mod tests {
         assert!(gpu_profile_matches_reading(1, &target, false, None));
         // GED pipeline mismatch alone is not drift for the periodic guard.
         assert!(!gpu_profile_matches_reading(1, &target, false, Some(false)));
+    }
+
+    #[test]
+    fn a_ladder_index_resolves_to_the_frequency_the_floor_publishes() {
+        // The floor is published twice: the ladder index on the GED node and
+        // the frequency on the module parameters. The driver resolves the floor
+        // from both, so the two have to name the same clock -- the ramp moves
+        // the index on every tick and has to move the frequency with it.
+        let table = dash_working_opp_table();
+        let khz = |index: i32| {
+            table
+                .iter()
+                .find(|(opp_index, _)| *opp_index == index)
+                .map(|(_, khz)| *khz)
+        };
+        assert_eq!(khz(51), Some(338_000));
+        assert_eq!(khz(49), Some(572_000));
+        assert_eq!(khz(0), Some(1_612_000));
+        // The collapsed plateau: 24 ladder slots all name the 1430 MHz clock,
+        // so a floor index inside it always publishes that same frequency.
+        assert_eq!(khz(7), Some(1_430_000));
+        assert_eq!(khz(30), Some(1_430_000));
     }
 
     #[test]

@@ -106,6 +106,29 @@ original wording.
   alongside the zip and APK so the updater never has to trust a bare
   download.
 
+## 1.18.19
+
+Codename: Nihal. **Pre-release.** The Gaming Dynamic profile, which was the
+one profile that never worked on this device.
+
+- Gaming Dynamic's clock is no longer left where the vendor put it. The load
+  ramp compared its target against its own cache instead of against the live
+  node, so once the MediaTek power service reclaimed the floor -- which it
+  does every couple of hundred milliseconds -- the ramp never wrote again and
+  the clock stayed at the 338 MHz floor. The ramp compares against the live
+  node now, so a reclaim is corrected on the next tick. This is why Balanced
+  and Extreme Beast worked while only Gaming failed: Balanced's governor is the
+  vendor's own, so the vendor drives the clock there, and Beast freezes DVFS
+  at the target, but Gaming depends on the ramp's write actually landing.
+- The floor is published as a pair, the ladder index on the GED node and the
+  frequency on the `gpu_bottom_freq` / `gpu_cust_boost_freq` module
+  parameters, and both are written together. The driver resolves the floor from
+  both, so a ramp that moved the index while the frequency still named the
+  minimum would have kept the clock on the floor.
+- The comment that described the boost node as the frequency the GPU runs at
+  is gone; it is the floor, and it was the wrong reading that the last few
+  releases were built on.
+
 ## 1.18.18
 
 Codename: Mizar. **Pre-release.** The dashboard's GPU monitor stops showing a
