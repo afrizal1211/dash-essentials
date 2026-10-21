@@ -391,6 +391,42 @@ static PER_APP_GPU_OVERRIDE: AtomicBool = AtomicBool::new(false);
 
 fn set_per_app_gpu_override(active: bool) {
     PER_APP_GPU_OVERRIDE.store(active, Ordering::Release);
+    if !active {
+        PER_APP_GPU_PROFILE.store(-1, Ordering::Release);
+    }
+}
+
+/// The GPU profile a Per-App Controls override applied, or `-1` when no
+/// override is in force.
+///
+/// The background guard needs it to maintain the *override's* nodes. The
+/// guard used to skip the GPU entirely while an override was active, which
+/// left the override's boost target to the vendor's power service -- and that
+/// service rewrites it to the slowest OPP every couple of hundred
+/// milliseconds, so the app's own profile silently ran at the 338 MHz floor.
+static PER_APP_GPU_PROFILE: AtomicI32 = AtomicI32::new(-1);
+
+fn set_per_app_gpu_profile(profile: i32) {
+    PER_APP_GPU_PROFILE.store(profile, Ordering::Release);
+}
+
+fn per_app_gpu_profile() -> i32 {
+    PER_APP_GPU_PROFILE.load(Ordering::Acquire)
+}
+
+/// The profile the background guard maintains. While a Per-App Controls
+/// override owns the GPU it is the override's profile, so the guard keeps the
+/// app's nodes alive instead of the global profile's. `-1` means an override
+/// is in flight and its profile is not known yet, so the guard must leave the
+/// GPU alone for that tick rather than fall back to the global profile and
+/// reassert it over the write in progress. Pure so it can be tested without a
+/// Mali device.
+fn guard_profile(override_active: bool, override_profile: i32, global_profile: i32) -> i32 {
+    if override_active {
+        override_profile
+    } else {
+        global_profile
+    }
 }
 
 fn per_app_gpu_override_active() -> bool {
@@ -1930,16 +1966,6 @@ fn set_io_scheduler(scheduler: &str) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-#[allow(dead_code)]
-fn write_if_present(path: &str, value: &str) -> Result<bool, String> {
-    let p = Path::new(path);
-    if !p.exists() {
-        return Ok(false);
-    }
-    service_control::write(p, format!("{value}\n")).map_err(|e| format!("write {path}: {e}"))?;
-    Ok(true)
 }
 
 /// Dash registers the Mali devfreq cooler at an index that depends on probe
@@ -5336,23 +5362,37 @@ fn gaming_dynamic_guard() {
         };
 
         // A Per-App Controls GPU override owns the Mali profile while it is in
-        // force. The guard must not touch the GPU then: it would reassert the
-        // global profile's nodes over the app's override (which is how a stock
-        // global profile dragged per-app gaming clocks back down) and fight the
-        // app's own state. Non-GPU maintenance above and the guard's other
-        // duties are unaffected.
-        if per_app_gpu_override_active() {
-            drop(profile_guard);
-            drop(service_gate);
-            std::thread::sleep(Duration::from_millis(100));
-            continue;
-        }
-
-        let profile = persisted_state()
+        // force, so the guard has to maintain the *override's* nodes and not
+        // the global profile's: reasserting the global profile over the app's
+        // override is how a stock global profile dragged per-app gaming clocks
+        // back down.
+        //
+        // Skipping the GPU altogether was the other half of that mistake, and
+        // the more damaging one. The MediaTek power service rewrites GED's
+        // boost target to the slowest OPP every couple of hundred
+        // milliseconds, and the boost target is the clock the GPU runs at on
+        // this firmware, so an override nobody maintained ran at the 338 MHz
+        // floor from the moment the vendor service touched it.
+        let global_profile = persisted_state()
             .lock()
             .ok()
             .map(|state| state.perf)
             .unwrap_or(0);
+        let profile = guard_profile(
+            per_app_gpu_override_active(),
+            per_app_gpu_profile(),
+            global_profile,
+        );
+        // An override is in flight and its profile is not known yet. Leave
+        // the GPU alone for this tick rather than falling back to the global
+        // profile, which would reassert the global nodes over the write the
+        // override is in the middle of making.
+        if profile < 0 {
+            drop(profile_guard);
+            drop(service_gate);
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
 
         let desired_ged_boost = profile_uses_ged_boost(profile);
         if profile >= 0 && !gpu_boost_pipeline_matches(desired_ged_boost) {
@@ -6212,16 +6252,16 @@ fn live_gpu_opp_table() -> Option<&'static [(i32, i32)]> {
 }
 
 /// Which side of a requested frequency to stay on when the firmware ladder has
-/// no exact match. Both bounds round towards the safe side of the request, so a
-/// caller never ends up with a looser cap or a lower floor than it asked for.
+/// no exact match. The bound rounds towards the safe side of the request, so a
+/// caller never ends up with a looser cap than it asked for.
+///
+/// There is only one bound left. The opposite one -- the slowest OPP that
+/// still runs at or above the request -- was how the boost target used to be
+/// written, as a frequency floor. It is gone because on this firmware the
+/// boost target is the frequency the GPU runs at, not a floor it may not go
+/// below: a non-zero index runs the GPU low instead of raising a floor.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FreqBound {
-    /// The slowest OPP that still runs at or above the request. Kept for the
-    /// mapping's contract and tests; production callers now only ever write a
-    /// literal `0` boost target or an `AtMost` ceiling, because a non-zero boost
-    /// index runs the GPU low on this firmware rather than raising a floor.
-    #[cfg_attr(not(test), allow(dead_code))]
-    AtLeast,
     /// The fastest OPP that stays at or below the request, for
     /// `custom_upbound_gpu_freq`. Rounding up would leave the cap looser than
     /// the caller asked for.
@@ -6231,13 +6271,6 @@ enum FreqBound {
 fn opp_index_for_freq_mhz(table: &[(i32, i32)], mhz: i32, bound: FreqBound) -> Option<i32> {
     let target = mhz.saturating_mul(1000);
     let (matching, saturate) = match bound {
-        FreqBound::AtLeast => (
-            table
-                .iter()
-                .filter(|(_, khz)| *khz >= target)
-                .max_by_key(|(index, _)| *index),
-            table.iter().min_by_key(|(index, _)| *index),
-        ),
         FreqBound::AtMost => (
             table
                 .iter()
@@ -6247,9 +6280,8 @@ fn opp_index_for_freq_mhz(table: &[(i32, i32)], mhz: i32, bound: FreqBound) -> O
         ),
     };
 
-    // A request outside the ladder saturates at the end it ran off: a floor
-    // above the fastest OPP pins to that OPP, and a cap below the slowest OPP
-    // pins to the slowest one.
+    // A request outside the ladder saturates at the end it ran off: a cap
+    // below the slowest OPP pins to the slowest one.
     matching.or(saturate).map(|(index, _)| *index)
 }
 
@@ -8509,8 +8541,9 @@ pub fn serve_client(stream: UnixStream) {
 mod tests {
     use super::{
         GPU_UNCAPPED_ARMED, GpuLimitRow, GpuReadings, beast_lock_ready, boost_target_drifted,
-        gpu_profile_matches, gpu_profile_matches_reading, gpu_uncap_armed, parse_gpu_limit_row,
-        parse_ppm_ceiling_index, per_app_gpu_override_active, set_per_app_gpu_override,
+        gpu_profile_matches, gpu_profile_matches_reading, gpu_uncap_armed, guard_profile,
+        parse_gpu_limit_row, parse_ppm_ceiling_index, per_app_gpu_override_active,
+        set_per_app_gpu_override,
     };
 
     fn readings<'a>(
@@ -8717,6 +8750,22 @@ mod tests {
     }
 
     #[test]
+    fn the_guard_maintains_the_overriding_app_profile_not_the_global_one() {
+        // Live field failure: a per-app GPU override applied the profile once
+        // and the guard skipped the GPU entirely afterwards, so the MediaTek
+        // power service's reclaim of GED's boost target was never corrected
+        // and the app's profile ran at the 338 MHz floor.
+        assert_eq!(guard_profile(true, 1, 0), 1);
+        assert_eq!(guard_profile(true, 3, 0), 3);
+        // Without an override the global profile is maintained.
+        assert_eq!(guard_profile(false, -1, 2), 2);
+        assert_eq!(guard_profile(false, 1, 0), 0);
+        // An override in flight has no profile yet: the guard must leave the
+        // GPU alone rather than reassert the global profile over the write.
+        assert_eq!(guard_profile(true, -1, 0), -1);
+    }
+
+    #[test]
     fn a_reclaimed_boost_target_is_drift_for_every_opp_profile() {
         // Live field failure: the vendor stack reclaimed GED's boost target
         // and pointed it at a slow OPP. On this firmware the target is the
@@ -8827,19 +8876,18 @@ mod tests {
     #[cfg(not(target_os = "android"))]
     use super::run_process_with_timeout;
     use super::{
-        AppUidPolicy, FreqBound, GPU_BATTERY_CEILING_MHZ, GPU_MIN_FREQ_MHZ,
-        MI_THERMAL_NO_LIMITS_MODE, PersistedState, charging_profile_fcc_ua,
-        classify_touch_panel_version, client_uid_allowed, command_key, cpu_frequency_drift_status,
-        find_touch_thp_config_offset, gaming_dynamic_target_opp, gpu_profile_accepted,
-        mi_thermal_cpu_limit_request, migrate_legacy_gpu_profile_cpu_state,
-        mtk_powerhal_cpu_range_request, normalize_charging_profile,
-        normalize_mi_thermal_config_mode, normalize_reported_power_w, opp_index_for_freq_mhz,
-        opp_index_stepped_by_levels, package_app_id_from_packages_list, parse_cpu_frequency_table,
-        parse_cpu_time_in_state, parse_ged_current_frequency_mhz, parse_gpufreq_opp_table,
-        persisted_cpu_ranges_active, profile_uses_ged_boost, scaled_display_density,
-        settings_readback_mismatch, snapshot_safe_text, tcp_client_uid_from_table,
-        touch_error_code_for, touch_hal_profile_sequence, valid_charging_profile,
-        valid_mi_thermal_config_mode, validate_cpu_frequency_range_against,
+        AppUidPolicy, FreqBound, GPU_BATTERY_CEILING_MHZ, MI_THERMAL_NO_LIMITS_MODE,
+        PersistedState, charging_profile_fcc_ua, classify_touch_panel_version, client_uid_allowed,
+        command_key, cpu_frequency_drift_status, find_touch_thp_config_offset,
+        gaming_dynamic_target_opp, gpu_profile_accepted, mi_thermal_cpu_limit_request,
+        migrate_legacy_gpu_profile_cpu_state, mtk_powerhal_cpu_range_request,
+        normalize_charging_profile, normalize_mi_thermal_config_mode, normalize_reported_power_w,
+        opp_index_for_freq_mhz, opp_index_stepped_by_levels, package_app_id_from_packages_list,
+        parse_cpu_frequency_table, parse_cpu_time_in_state, parse_ged_current_frequency_mhz,
+        parse_gpufreq_opp_table, persisted_cpu_ranges_active, profile_uses_ged_boost,
+        scaled_display_density, settings_readback_mismatch, snapshot_safe_text,
+        tcp_client_uid_from_table, touch_error_code_for, touch_hal_profile_sequence,
+        valid_charging_profile, valid_mi_thermal_config_mode, validate_cpu_frequency_range_against,
     };
 
     fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
@@ -9137,24 +9185,6 @@ posdiv: 0, margin:     0, power:     0\n";
         // or above it, so 338 MHz maps to index 51. Production code no longer
         // writes a 338 MHz floor to the boost node (it would pin the clock
         // there); this pins the mapping's contract for the `AtLeast` bound.
-        assert_eq!(
-            opp_index_for_freq_mhz(&dash, GPU_MIN_FREQ_MHZ, FreqBound::AtLeast),
-            Some(51)
-        );
-        assert_eq!(
-            opp_index_for_freq_mhz(&dash, 1_612, FreqBound::AtLeast),
-            Some(3)
-        );
-        assert_eq!(
-            opp_index_for_freq_mhz(&dash, 1_700, FreqBound::AtLeast),
-            Some(0)
-        );
-        // 1000 MHz sits between 962 and 1014 MHz, so the floor rounds up.
-        assert_eq!(
-            opp_index_for_freq_mhz(&dash, 1_000, FreqBound::AtLeast),
-            Some(39)
-        );
-
         // A maximum-frequency cap resolves to the fastest OPP at or below the
         // request, so the 598 MHz battery ceiling becomes 572 MHz, not 624 MHz.
         assert_eq!(
@@ -9180,14 +9210,6 @@ posdiv: 0, margin:     0, power:     0\n";
             .map(|i| (i, (1_612_000 - i * 26_000).max(338_000)))
             .collect();
         assert_eq!(
-            opp_index_for_freq_mhz(&fine, 1_612, FreqBound::AtLeast),
-            Some(0)
-        );
-        assert_eq!(
-            opp_index_for_freq_mhz(&fine, 598, FreqBound::AtLeast),
-            Some(39)
-        );
-        assert_eq!(
             opp_index_for_freq_mhz(&fine, 598, FreqBound::AtMost),
             Some(39)
         );
@@ -9195,9 +9217,10 @@ posdiv: 0, margin:     0, power:     0\n";
             opp_index_for_freq_mhz(&fine, 338, FreqBound::AtMost),
             Some(49)
         );
+        // A cap above the fastest OPP saturates at the fastest one.
         assert_eq!(
-            opp_index_for_freq_mhz(&fine, 338, FreqBound::AtLeast),
-            Some(51)
+            opp_index_for_freq_mhz(&fine, 1_700, FreqBound::AtMost),
+            Some(0)
         );
     }
 
@@ -9205,7 +9228,6 @@ posdiv: 0, margin:     0, power:     0\n";
     fn empty_ladder_yields_no_ged_index() {
         // Nothing to resolve against must report "unknown" so the daemon leaves
         // GED's indices untouched instead of pinning a guessed floor.
-        assert_eq!(opp_index_for_freq_mhz(&[], 338, FreqBound::AtLeast), None);
         assert_eq!(opp_index_for_freq_mhz(&[], 598, FreqBound::AtMost), None);
     }
 

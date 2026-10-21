@@ -752,16 +752,6 @@ pub struct ARect {
 }
 
 #[repr(C)]
-pub struct ANativeWindowBuffer {
-    width: i32,
-    height: i32,
-    stride: i32,
-    format: i32,
-    bits: *mut c_void,
-    reserved: [u32; 6],
-}
-
-#[repr(C)]
 pub struct ANativeActivityCallbacks {
     on_start: Option<unsafe extern "C" fn(*mut ANativeActivity)>,
     on_resume: Option<unsafe extern "C" fn(*mut ANativeActivity)>,
@@ -926,16 +916,6 @@ unsafe extern "C" {
         height: i32,
         format: i32,
     ) -> i32;
-
-    #[allow(dead_code)]
-    fn ANativeWindow_lock(
-        window: *mut ANativeWindow,
-        out_buffer: *mut ANativeWindowBuffer,
-        in_out_dirty_bounds: *mut ARect,
-    ) -> i32;
-
-    #[allow(dead_code)]
-    fn ANativeWindow_unlockAndPost(window: *mut ANativeWindow) -> i32;
 
     fn AAssetManager_open(
         manager: *mut AAssetManager,

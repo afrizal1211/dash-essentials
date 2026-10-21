@@ -106,6 +106,38 @@ original wording.
   alongside the zip and APK so the updater never has to trust a bare
   download.
 
+## 1.18.16
+
+Codename: Alcyone. **Pre-release.** Fixes the Per-App Controls GPU profiles
+and removes the code that the earlier GPU work left behind.
+
+- A per-app GPU profile is now actually maintained while the app is in the
+  foreground. The background guard skipped the GPU entirely during an
+  override, which left the override's boost target to the MediaTek power
+  service -- and that service rewrites the node to the slowest OPP every
+  couple of hundred milliseconds. Since the boost target is the frequency the
+  GPU runs at on this firmware, the app's profile silently ran at the 338 MHz
+  floor from the moment the vendor service touched it. The guard now maintains
+  the override's own profile instead of the global one, and the profile the
+  override applied is reconciled at every ownership boundary.
+- Releasing a per-app GPU override no longer rewrites the user's global
+  profile. The restore called the persisting global apply, which wrote the
+  profile choice, its frequency bounds and the thermal-ceiling flag back into
+  the persisted state, so letting go of an app's override silently changed the
+  global choice and dropped the user's own GPU preferences. It now uses the
+  hardware-only apply.
+- The override is released before the global profile is restored, so the
+  guard cannot reassert the app's profile over the global one in the window
+  between the two writes.
+- Obsolete code removed. The boost target used to be written as a frequency
+  floor, which needed a "slowest OPP at or above the request" bound that no
+  production path has used since the boost target became the frequency the GPU
+  runs at; the bound and its dead branch are gone. A dead write helper, two
+  unused NDK bindings and the orphaned buffer type behind them are gone too.
+  The app's nested-detail back stack was removed with it: the method that
+  populated it was never called, so the field was always null and the branch
+  that read it could never run.
+
 ## 1.18.15
 
 Codename: Spica. **Pre-release.** The GPU frequency reporting and the thermal

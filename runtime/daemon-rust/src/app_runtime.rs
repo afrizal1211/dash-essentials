@@ -380,6 +380,9 @@ impl Hardware for Adapter {
                 // choice, so a stock global profile cannot drag the app's
                 // gaming clocks back down.
                 set_per_app_gpu_override(true);
+                // The guard maintains the override's own nodes, so it has to
+                // know which profile the override applied.
+                set_per_app_gpu_profile(*v as i32);
                 apply_performance_profile_hardware(*v as i32)
             }
             // Hardware write only: the saved global choice stays in
@@ -420,7 +423,20 @@ impl Hardware for Adapter {
             match c {
                 Control::Touch => set_touch_profile(saved.state.touch.max(0))?,
                 Control::Gpu => {
-                    apply_performance_profile(saved.state.perf)?;
+                    // Release the override *before* the global profile is
+                    // written. The guard maintains whichever profile owns the
+                    // GPU, so leaving the override flagged until the applied
+                    // set is reconciled at the end of the transition would let
+                    // the guard reassert the app's profile over the global
+                    // one that is being restored right here.
+                    set_per_app_gpu_override(false);
+                    // The hardware-only apply. The persisting global apply
+                    // would rewrite the user's global profile from the
+                    // per-app restore: it persists `perf`, the profile's
+                    // frequency bounds and the thermal-ceiling flag, so
+                    // releasing an app's override silently changed the global
+                    // choice and dropped the user's own GPU preferences.
+                    apply_performance_profile_hardware(saved.state.perf)?;
                     let min = saved.state.gpu_min_freq_mhz;
                     let max = saved.state.gpu_max_freq_mhz;
                     if min > 0 && max >= min {
@@ -543,9 +559,19 @@ impl Hardware for Adapter {
     /// permanently ignoring the Mali nodes — the single most damaging failure
     /// mode of a hand-maintained toggle.
     fn sync_applied(&mut self, applied: &BTreeMap<Control, Target>) {
-        if applied.contains_key(&Control::Gpu) != per_app_gpu_override_active() {
-            set_per_app_gpu_override(applied.contains_key(&Control::Gpu));
+        let owns_gpu = applied.contains_key(&Control::Gpu);
+        if owns_gpu != per_app_gpu_override_active() {
+            set_per_app_gpu_override(owns_gpu);
         }
+        // The profile the override applied, so the guard maintains that
+        // profile's nodes. It is cleared when the control is not applied, so
+        // a released override can never leave the guard maintaining a profile
+        // that is no longer in force.
+        let profile = match applied.get(&Control::Gpu) {
+            Some(Target::Gpu(v)) => *v as i32,
+            _ => -1,
+        };
+        set_per_app_gpu_profile(profile);
     }
 }
 

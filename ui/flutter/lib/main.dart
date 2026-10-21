@@ -314,7 +314,6 @@ class _DashShellState extends State<DashShell>
 
   DashScreen _screen = DashScreen.home;
   DashScreen _detailBackTarget = DashScreen.home;
-  DashScreen? _nestedDetailBackTarget;
   bool _rootSwipeLocked = false;
   bool _rootNavAnimating = false;
   DashScreen? _rootNavTarget;
@@ -556,7 +555,6 @@ class _DashShellState extends State<DashShell>
     setState(() {
       _screen = screen;
       _detailBackTarget = screen;
-      _nestedDetailBackTarget = null;
       _rootNavAnimating = _rootController.hasClients;
       _rootNavTarget = screen;
     });
@@ -632,7 +630,6 @@ class _DashShellState extends State<DashShell>
     setState(() {
       _screen = next;
       _detailBackTarget = next;
-      _nestedDetailBackTarget = null;
     });
 
     _syncNativeBackInterception();
@@ -652,24 +649,6 @@ class _DashShellState extends State<DashShell>
       if (_screen.isRoot) {
         _detailBackTarget = _screen;
       }
-      _nestedDetailBackTarget = null;
-      _screen = screen;
-    });
-
-    _syncNativeBackInterception();
-  }
-
-  // ignore: unused_element
-  void _openNestedDetail(DashScreen screen) {
-    if (screen.isRoot || _screen.isRoot) {
-      _openDetail(screen);
-      return;
-    }
-
-    final DashScreen parent = _screen;
-
-    setState(() {
-      _nestedDetailBackTarget = parent;
       _screen = screen;
     });
 
@@ -684,18 +663,6 @@ class _DashShellState extends State<DashShell>
       return;
     }
     if (DashNestedBackController.handleBack()) {
-      return;
-    }
-
-    final DashScreen? nestedTarget = _nestedDetailBackTarget;
-
-    if (nestedTarget != null && !_screen.isRoot) {
-      setState(() {
-        _screen = nestedTarget;
-        _nestedDetailBackTarget = null;
-      });
-
-      _syncNativeBackInterception();
       return;
     }
 
@@ -714,7 +681,6 @@ class _DashShellState extends State<DashShell>
 
     setState(() {
       _screen = target;
-      _nestedDetailBackTarget = null;
     });
 
     _syncNativeBackInterception();
